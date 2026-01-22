@@ -88,7 +88,7 @@ def get_data_files(base_dir=BASE_DIR):
     data_files.sort(key=lambda x: (x["construct"], x["subconstruct"], str(x["replica"]), x["start_frame"]))
     return data_files
 
-def data_iterator(base_dir=BASE_DIR, chunk_size=None, residue_list=DEFAULT_RESIDUE_LIST):
+def data_iterator(base_dir=BASE_DIR, chunk_size=None, residue_list=DEFAULT_RESIDUE_LIST, keep_features=None):
     """
     Iterative data provider that yields DataFrames with metadata.
     
@@ -96,6 +96,7 @@ def data_iterator(base_dir=BASE_DIR, chunk_size=None, residue_list=DEFAULT_RESID
         base_dir: Root directory to search for data.
         chunk_size: If provided, yields DataFrames in chunks of this many rows.
         residue_list: List of residues used to generate pairwise distance columns.
+        keep_features: List of feature names to keep. If None, keeps all.
     
     Yields:
         pd.DataFrame: A DataFrame with pairwise distance data, metadata, and frame numbers.
@@ -106,6 +107,14 @@ def data_iterator(base_dir=BASE_DIR, chunk_size=None, residue_list=DEFAULT_RESID
     if not data_files:
         print(f"No data files found in {base_dir}")
         return
+
+    metadata_cols = ['construct', 'subconstruct', 'replica', 'frame_number']
+    
+    # Pre-compute columns to keep if specified
+    final_cols = None
+    if keep_features is not None:
+        # Ensure metadata columns are always included
+        final_cols = metadata_cols + [f for f in keep_features if f not in metadata_cols]
 
     for file_info in data_files:
         try:
@@ -127,6 +136,13 @@ def data_iterator(base_dir=BASE_DIR, chunk_size=None, residue_list=DEFAULT_RESID
             # Assign frame_number (1-indexed, starting from start_frame)
             df['frame_number'] = np.arange(len(df)) + file_info['start_frame']
             
+            # Filter columns if requested
+            if final_cols:
+                # Only keep columns that exist in the dataframe
+                # (Intersection to be safe against missing features)
+                available_cols = [c for c in final_cols if c in df.columns]
+                df = df[available_cols]
+
             if chunk_size:
                 for i in range(0, len(df), chunk_size):
                     # We use .copy() to ensure we don't have a view of the original mmapped data 

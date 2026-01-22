@@ -6,17 +6,7 @@ from kneed import KneeLocator
 import sys
 import os
 
-# Add parent directory to path to import data_access
-# This ensures we can import data_access when running this script directly or from '2_feature_extraction'
-current_dir = os.path.dirname(os.path.abspath(__file__))
-parent_dir = os.path.dirname(current_dir)
-if parent_dir not in sys.path:
-    sys.path.append(parent_dir)
 
-try:
-    from data_access import data_iterator
-except ImportError:
-    print("Warning: Could not import data_iterator from data_access. Make sure the 'lda' directory is in your Python path.")
 
 def compute_streaming_variance(df_iterator):
     """
@@ -144,66 +134,42 @@ def plot_variance(variance_series, threshold):
     plt.savefig('variance_plot.png')
     print("Variance plot saved to variance_plot.png")
 
-def remove_low_variance_features(threshold=None):
+def remove_low_variance_features(data, threshold=None):
     """
-    Computes variance from data_iterator, finds threshold (if None), plots,
+    Computes variance from the provided data iterator, finds threshold (if None), 
     and returns the list of feature names with variance > threshold.
+    
+    Args:
+        data: An iterator yielding pandas DataFrames.
+        threshold (float, optional): variance threshold to cut off at. 
+                                     If None, uses knee detection.
+        
+    Returns:
+        tuple: (selected_features_list, threshold_used)
     """
-    # 1. Get Data Iterator
-    try:
-        iterator = data_iterator()
-    except NameError:
-        print("Error: data_iterator is not defined. Check imports.")
-        return []
-
-    # 2. Compute Variance
+    # 1. Compute Variance
     print("Computing streaming variance...")
-    variance_series = compute_streaming_variance(iterator)
+    variance_series = compute_streaming_variance(data)
     
     if variance_series.empty:
         print("Variance calculation failed or returned empty.")
-        return []
+        return [], 0.0
 
-    # 3. Determine Threshold
+    # 2. Determine Threshold
     if threshold is None:
         threshold = get_knee_point(variance_series)
     
-    # 4. Plot
+    # 3. Plot
     plot_variance(variance_series, threshold)
     
-    # 5. Filter Features
+    # 4. Identify Features
     high_var_features = variance_series[variance_series > threshold].index.tolist()
     print(f"Retaining {len(high_var_features)} features with variance > {threshold}")
     
-    # 6. Retrieve Data with Selected Features
-    print("Reloading data with selected features...")
-    filtered_frames = []
-    
-    # Re-initialize iterator to go through data again
-    final_iterator = data_iterator()
-    
-    metadata_cols = ['construct', 'subconstruct', 'replica', 'frame_number']
-    # Ensure metadata columns are included in the final output
-    cols_to_keep = metadata_cols + high_var_features
-    
-    for df in final_iterator:
-        # Select available columns (handles case where some chunks might not have all metadata if structure changes, though unlikely)
-        # We intersection with existing columns to be safe
-        available_cols = [c for c in cols_to_keep if c in df.columns]
-        filtered_frames.append(df[available_cols].copy())
-        
-    if filtered_frames:
-        final_df = pd.concat(filtered_frames, ignore_index=True)
-        print(f"Final DataFrame shape: {final_df.shape}")
-        return final_df
-    else:
-        return pd.DataFrame()
+    return high_var_features, threshold
 
 if __name__ == "__main__":
     # Example usage
-    df_result = remove_low_variance_features()
-    if not df_result.empty:
-        print(f"Resulting DataFrame shape: {df_result.shape}")
-        print("First 5 rows:")
-        print(df_result.head())
-        print("Columns:", df_result.columns.tolist()[:10], "...")
+    # This requires an iterator to be passed in, so we can't run it standalone easily without mocking
+    print("This script is now a library function. Import and call 'remove_low_variance_features(data_iterator)'")
+
