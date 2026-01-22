@@ -105,6 +105,11 @@ def get_knee_point(values):
     
     # Use KneeLocator to find the "elbow"
     # curve='convex' and direction='decreasing' are typical for scree plots / variance distributions
+    if KneeLocator is None:
+        print("Error: 'kneed' library is not installed. unique knee detection cannot be performed.")
+        print("Please install it via 'pip install kneed' or provide a manual threshold.")
+        return 0.0
+        
     knee_locator = KneeLocator(x, y, curve='convex', direction='decreasing')
     knee_idx = knee_locator.knee
     
@@ -170,10 +175,35 @@ def remove_low_variance_features(threshold=None):
     high_var_features = variance_series[variance_series > threshold].index.tolist()
     print(f"Retaining {len(high_var_features)} features with variance > {threshold}")
     
-    return high_var_features
+    # 6. Retrieve Data with Selected Features
+    print("Reloading data with selected features...")
+    filtered_frames = []
+    
+    # Re-initialize iterator to go through data again
+    final_iterator = data_iterator()
+    
+    metadata_cols = ['construct', 'subconstruct', 'replica', 'frame_number']
+    # Ensure metadata columns are included in the final output
+    cols_to_keep = metadata_cols + high_var_features
+    
+    for df in final_iterator:
+        # Select available columns (handles case where some chunks might not have all metadata if structure changes, though unlikely)
+        # We intersection with existing columns to be safe
+        available_cols = [c for c in cols_to_keep if c in df.columns]
+        filtered_frames.append(df[available_cols].copy())
+        
+    if filtered_frames:
+        final_df = pd.concat(filtered_frames, ignore_index=True)
+        print(f"Final DataFrame shape: {final_df.shape}")
+        return final_df
+    else:
+        return pd.DataFrame()
 
 if __name__ == "__main__":
     # Example usage
-    features = remove_low_variance_features()
-    if features:
-        print(f"Selected {len(features)} features. First 5: {features[:5]}")
+    df_result = remove_low_variance_features()
+    if not df_result.empty:
+        print(f"Resulting DataFrame shape: {df_result.shape}")
+        print("First 5 rows:")
+        print(df_result.head())
+        print("Columns:", df_result.columns.tolist()[:10], "...")
