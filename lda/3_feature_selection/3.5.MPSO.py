@@ -13,6 +13,7 @@ from sklearn.ensemble import BaggingClassifier, RandomForestClassifier
 from niapy.problems import Problem
 from niapy.task import Task
 from niapy.algorithms.basic import ParticleSwarmOptimization
+import time
 
 # User Inputs
 Total_Dimensions = 5
