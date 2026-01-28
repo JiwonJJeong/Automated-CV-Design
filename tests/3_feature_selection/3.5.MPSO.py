@@ -19,7 +19,7 @@ Total_Dimensions = 5
 constrain_aim_rescount = 3
 constrain_aim_respair = 1
 Preselected_features = "".split(", ")
-input_feature = 'sample_CA_post_variance.csv' # Use the output file obtained after feature selection
+input_feature = '../2_feature_extraction/sample_CA_post_variance.csv' # Use the output file obtained after feature selection
 iteration = 1 # Change the iteration number after each run ends
 
 if iteration == 1:

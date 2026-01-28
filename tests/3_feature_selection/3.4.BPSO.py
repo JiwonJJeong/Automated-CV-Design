@@ -31,7 +31,7 @@ class SVMFeatureSelection(Problem):
         num_features = self.X_train.shape[1]
         return self.alpha * score + (1 - self.alpha) * (num_selected / num_features)
 
-df = pd.read_csv('sample_CA_post_variance.csv') # Use the output file obtained after feature selection
+df = pd.read_csv('../2_feature_extraction/sample_CA_post_variance.csv') # Use the output file obtained after feature selection
 dfClassVec = df['class']
 df = df.drop('class', axis=1)
 feature_names = df.columns.values
