@@ -8,6 +8,8 @@ import os
 
 
 
+METADATA_COLS = {'construct', 'subconstruct', 'replica', 'frame_number'}
+
 def compute_streaming_variance(df_iterator):
     """
     Calculates variance across multiple DataFrames iteratively.
@@ -23,8 +25,6 @@ def compute_streaming_variance(df_iterator):
     mean_a = None
     m2_a = None  # Sum of squares of differences from the mean (SSE)
 
-    metadata_cols = {'construct', 'subconstruct', 'replica', 'frame_number'}
-
     first_chunk = True
 
     if df_iterator is None:
@@ -33,7 +33,7 @@ def compute_streaming_variance(df_iterator):
     for df in df_iterator:
         # Filter feature columns
         if first_chunk:
-            feature_cols = [c for c in df.columns if c not in metadata_cols]
+            feature_cols = [c for c in df.columns if c not in METADATA_COLS]
             # Initialize state with zeros for appropriate shape
             num_features = len(feature_cols)
             mean_a = np.zeros(num_features)
@@ -134,9 +134,9 @@ def plot_variance(variance_series, threshold):
     plt.savefig('variance_plot.png')
     print("Variance plot saved to variance_plot.png")
 
-def remove_low_variance_features(data, threshold=None):
+def calculate_features_with_low_variance(data, threshold=None):
     """
-    Computes variance from the provided data iterator, finds threshold (if None), 
+    Calculates feature variances from the provided data iterator, finds threshold (if None), 
     and returns the list of feature names with variance > threshold.
     
     Args:
@@ -168,8 +168,27 @@ def remove_low_variance_features(data, threshold=None):
     
     return high_var_features, threshold
 
+def remove_low_variance_features(data, selected_features):
+    """
+    Actually filters the provided data to keep only the selected features.
+    If data is a single DataFrame, returns a filtered DataFrame.
+    If data is an iterator, returns a generator yielding filtered DataFrames.
+    
+    Always preserves metadata columns if they exist.
+    """
+    def filter_df(df):
+        # Identify which columns to keep (selected features + any metadata present)
+        cols_to_keep = [c for c in df.columns if c in selected_features or c in METADATA_COLS]
+        return df[cols_to_keep]
+
+    if isinstance(data, pd.DataFrame):
+        return filter_df(data)
+    else:
+        # Assume it's an iterator/generator
+        return (filter_df(df) for df in data)
+
 if __name__ == "__main__":
     # Example usage
     # This requires an iterator to be passed in, so we can't run it standalone easily without mocking
-    print("This script is now a library function. Import and call 'remove_low_variance_features(data_iterator)'")
+    print("This script is now a library function. Import and call 'calculate_features_with_low_variance(data_iterator)'")
 
