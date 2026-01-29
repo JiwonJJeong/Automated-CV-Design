@@ -7,6 +7,7 @@ import fisher_score_mod as fsm
 from kneed import KneeLocator
 import argparse
 import os
+from collections.abc import Iterable
 
 def calculate_fisher_scores(df, target_col='class'):
     """
@@ -18,13 +19,11 @@ def calculate_fisher_scores(df, target_col='class'):
     
     # Calculate Fisher scores
     score = fsm.fisher_score(X.to_numpy(), y, mode='score')
-    df_scores = pd.DataFrame(score)
-    df_scores.to_csv('fisher_scores_dfres.csv', encoding='utf-8', index=True, header=None)
+    # Removed CSV saving of scores
     
     # Calculate Fisher indices
     idx = fsm.fisher_score(X.to_numpy(), y, mode='index')
-    df_indices = pd.DataFrame(idx)
-    df_indices.to_csv('fisher_indices_dfres.csv', encoding='utf-8', index=True, header=None)
+    # Removed CSV saving of indices
     
     return score, idx
 
@@ -38,7 +37,7 @@ def find_optimal_n_feat(scores, S=5, curve='convex', direction='decreasing'):
     
     # Sort scores in descending order
     df_scores_sorted = df_scores.sort_values(by='fs', ascending=False).reset_index(drop=True)
-    df_scores_sorted.to_csv('fisher_scores_dfres_descending.csv', index=False)
+    # Removed CSV saving of sorted scores
     
     x = list(range(len(df_scores_sorted)))
     y = df_scores_sorted['fs']
@@ -62,34 +61,39 @@ def prepare_amino_input(df_selected):
     print(f"Created {len(all_ops)} OrderParameters.")
     return all_ops
 
-def run_amino(all_ops, max_outputs=5, bins=10, distortion_filename='distortion_array'):
+def run_amino(all_ops, max_outputs=5, bins=10):
     """
     Runs the AMINO algorithm to find the final reduced set of features.
     """
     print(f"Running AMINO with max_outputs={max_outputs}, bins={bins}...")
     gc.collect()
-    final_ops = amino.find_ops(all_ops, max_outputs, bins, distortion_filename=distortion_filename)
+    # Explicitly disable file output by passing None if supported
+    final_ops = amino.find_ops(all_ops, max_outputs, bins, distortion_filename=None)
     
-    # Save final OPs to file
-    with open('output2_final_OPs.txt', 'w') as f:
-        print("\nAMINO order parameters:")
-        for op in final_ops:
-            f.write(f"{op}\n")
-            print(op)
-            
-    # Save distortion summary
-    if os.path.exists(f'{distortion_filename}.npy'):
-        data_array = np.load(f'{distortion_filename}.npy')
-        with open('output3_distortion_array.txt', 'w') as f:
-            f.write(f"{data_array}\n")
-        print("\nData summary:\n", data_array)
+    print("\nAMINO selected features:")
+    for op in final_ops:
+        print(op)
+        
+    # Removed distortion summary saving
         
     return final_ops
 
 def run_fisher_amino_workflow(df, target_col='class', n_feat_amino=5, bins_amino=10):
     """
     Orchestrates the Fisher-AMINO feature selection workflow.
+    Accepts DataFrame or Iterator[DataFrame].
+    Returns Iterator[DataFrame] with selected features.
     """
+    
+    # 0. Handle Iterator -> Full DataFrame
+    if isinstance(df, Iterable) and not isinstance(df, pd.DataFrame):
+        print("Consuming DataFrame iterator for Fisher-AMINO...")
+        df = pd.concat(df, ignore_index=True)
+
+    # Validation
+    if target_col not in df.columns:
+        raise ValueError(f"Target column '{target_col}' not found in dataset columns: {df.columns.tolist()}")
+
     # 1. Calculate Fisher Scores
     scores, indices = calculate_fisher_scores(df, target_col)
     
@@ -107,14 +111,15 @@ def run_fisher_amino_workflow(df, target_col='class', n_feat_amino=5, bins_amino
     # 5. Run AMINO
     final_ops = run_amino(all_ops, max_outputs=n_feat_amino, bins=bins_amino)
     
-    # 6. Final save (merging with classes)
+    # 6. Final preparation
     final_col_names = [str(op) for op in final_ops]
     df_amino = reduced_X[final_col_names].copy()
     df_amino[target_col] = df[target_col].values
-    df_amino.to_csv('fisher-amino.csv', index=False)
-    print(f"Successfully saved final feature set to fisher-amino.csv with {len(final_col_names)} features.")
     
-    return final_ops
+    print(f"Fisher-AMINO completed. Selected {len(final_col_names)} features.")
+    
+    # Return as iterator
+    return [df_amino]
 
 def main():
     parser = argparse.ArgumentParser(description='Refactored Fisher-AMINO Feature Selection')
@@ -130,14 +135,21 @@ def main():
         return
 
     print(f"Loading dataset: {args.dataset}")
-    df = pd.read_csv(args.dataset)
+    df_iter = [pd.read_csv(args.dataset)] # Simulate iterator
     
-    run_fisher_amino_workflow(
-        df=df,
-        target_col=args.target,
-        n_feat_amino=args.max_outputs,
-        bins_amino=args.bins
-    )
+    try:
+        result_iter = run_fisher_amino_workflow(
+            df=df_iter,
+            target_col=args.target,
+            n_feat_amino=args.max_outputs,
+            bins_amino=args.bins
+        )
+        for res_df in result_iter:
+            print(f"Result shape: {res_df.shape}")
+            # res_df.to_csv('fisher_amino_result.csv', index=False)
+            
+    except ValueError as e:
+        print(f"Error: {e}")
 
 if __name__ == "__main__":
     main()

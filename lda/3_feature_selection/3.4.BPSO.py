@@ -9,6 +9,7 @@ from sklearn.ensemble import BaggingClassifier
 from niapy.problems import Problem
 from niapy.task import Task
 from niapy.algorithms.basic import ParticleSwarmOptimization
+from collections.abc import Iterable
 
 class SVMFeatureSelection(Problem):
     def __init__(self, X_train, y_train, alpha=0.99, n_estimators=10):
@@ -33,15 +34,30 @@ class SVMFeatureSelection(Problem):
             n_jobs=-1
         )
 
+        # Cross-validation score
         accuracy = cross_val_score(clf, self.X_train[:, selected], self.y_train, cv=3, n_jobs=-1).mean()
         score = 1 - accuracy
         num_features = self.X_train.shape[1]
+        
+        # Multiobjective function: Minimize error + Minimize feature count
         return self.alpha * score + (1 - self.alpha) * (num_selected / num_features)
 
 def run_bpso_workflow(df, target_col='class', alpha=0.99, max_iters=100, population_size=30, seed=1234, n_estimators=10):
     """
     Runs the BPSO feature selection workflow.
+    Accepts DataFrame or Iterator[DataFrame].
+    Returns Iterator[DataFrame] with selected features.
     """
+    
+    # 0. Handle Iterator -> Full DataFrame
+    if isinstance(df, Iterable) and not isinstance(df, pd.DataFrame):
+        print("Consuming DataFrame iterator for BPSO...")
+        df = pd.concat(df, ignore_index=True)
+
+    # Validation
+    if target_col not in df.columns:
+        raise ValueError(f"Target column '{target_col}' not found in dataset columns: {df.columns.tolist()}")
+
     y = df[target_col].to_numpy()
     X = df.drop(target_col, axis=1).values
     feature_names = df.drop(target_col, axis=1).columns.values
@@ -71,20 +87,24 @@ def run_bpso_workflow(df, target_col='class', alpha=0.99, max_iters=100, populat
         n_jobs=1
     )
     
-    model_selected.fit(X_train[:, selected_mask], y_train)
-    test_score = model_selected.score(X_test[:, selected_mask], y_test)
-    cv_score = cross_val_score(model_selected, X_test[:, selected_mask], y_test, cv=5, n_jobs=1).mean()
-    
-    print(f"Subset accuracy on test: {test_score:.4f}")
-    print(f"Subset CV accuracy on test: {cv_score:.4f}")
+    # Check if any features selected
+    if selected_mask.sum() > 0:
+        model_selected.fit(X_train[:, selected_mask], y_train)
+        test_score = model_selected.score(X_test[:, selected_mask], y_test)
+        cv_score = cross_val_score(model_selected, X_test[:, selected_mask], y_test, cv=5, n_jobs=1).mean()
+        
+        print(f"Subset accuracy on test: {test_score:.4f}")
+        print(f"Subset CV accuracy on test: {cv_score:.4f}")
+        
+        # Prepare result dataframe
+        df_red = df[list(selected_feature_names) + [target_col]].copy()
+    else:
+        print("Warning: No features selected by BPSO!")
+        df_red = df[[target_col]].copy()
 
-    # Save results
-    df_red = df[list(selected_feature_names) + [target_col]]
-    output_filename = 'bpso_selected_features.csv'
-    df_red.to_csv(output_filename, index=False)
-    print(f"Saved selected features to {output_filename}")
-    
-    return selected_feature_names
+    # Removed CSV saving logic
+
+    return [df_red]
 
 def main():
     parser = argparse.ArgumentParser(description='Binary Particle Swarm Optimization (BPSO) for Feature Selection')
@@ -102,16 +122,26 @@ def main():
         print(f"Error: Dataset {args.dataset} not found.")
         return
 
-    df = pd.read_csv(args.dataset)
-    run_bpso_workflow(
-        df=df,
-        target_col=args.target,
-        alpha=args.alpha,
-        max_iters=args.iters,
-        population_size=args.pop,
-        seed=args.seed,
-        n_estimators=args.estimators
-    )
+    print(f"Loading dataset: {args.dataset}")
+    df_iter = [pd.read_csv(args.dataset)] # Simulate iterator
+
+    try:
+        result_iter = run_bpso_workflow(
+            df=df_iter,
+            target_col=args.target,
+            alpha=args.alpha,
+            max_iters=args.iters,
+            population_size=args.pop,
+            seed=args.seed,
+            n_estimators=args.estimators
+        )
+        
+        for res_df in result_iter:
+            print(f"BPSO completed. Result shape: {res_df.shape}")
+            # res_df.to_csv('bpso_result.csv', index=False)
+            
+    except ValueError as e:
+        print(f"Error: {e}")
 
 if __name__ == '__main__':
     main()
