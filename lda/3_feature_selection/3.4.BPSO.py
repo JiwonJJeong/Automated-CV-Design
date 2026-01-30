@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
-import argparse
-import os
+import h5py
+import gc
 from sklearn.model_selection import train_test_split, cross_val_score
 from sklearn.svm import LinearSVC
 from sklearn.multiclass import OneVsRestClassifier
@@ -9,139 +9,121 @@ from sklearn.ensemble import BaggingClassifier
 from niapy.problems import Problem
 from niapy.task import Task
 from niapy.algorithms.basic import ParticleSwarmOptimization
-from collections.abc import Iterable
+
+# --- H5 UTILITIES (Same as previous) ---
+
+def h5_chunk_iterator(h5_path, dataset_name='data', chunk_size=10000):
+    with h5py.File(h5_path, 'r') as f:
+        dataset = f[dataset_name]
+        total_rows = dataset.shape[0]
+        column_names = f[dataset_name].attrs.get('column_names')
+        if column_names is None:
+            column_names = [f'feature_{i}' for i in range(dataset.shape[1])]
+        for i in range(0, total_rows, chunk_size):
+            end = min(i + chunk_size, total_rows)
+            yield pd.DataFrame(dataset[i:end], columns=column_names)
+
+# --- PASS 1: STREAMING FISHER (To narrow the search space for BPSO) ---
+
+def compute_streaming_fisher(h5_path, target_col, dataset_name='data'):
+    """Quickly reduces thousands of features to a manageable few hundred."""
+    print("Pass 1: Filtering features via Streaming Fisher Score...")
+    stats = {}
+    feature_cols = None
+
+    for chunk in h5_chunk_iterator(h5_path, target_col=None): # Use default iterator
+        if feature_cols is None:
+            feature_cols = [c for c in chunk.columns if c not in {target_col, 'construct', 'replica'}]
+        
+        for label, group in chunk.groupby(target_col):
+            data = group[feature_cols].values
+            if label not in stats:
+                stats[label] = {'n': 0, 'sum': 0, 'sum_sq': 0}
+            stats[label]['n'] += data.shape[0]
+            stats[label]['sum'] += np.sum(data, axis=0)
+            stats[label]['sum_sq'] += np.sum(data**2, axis=0)
+
+    # Calculate final scores
+    total_n = sum(s['n'] for s in stats.values())
+    global_mean = sum(s['sum'] for s in stats.values()) / total_n
+    num, den = np.zeros(len(feature_cols)), np.zeros(len(feature_cols))
+    
+    for label, s in stats.items():
+        m_k = s['sum'] / s['n']
+        v_k = (s['sum_sq'] / s['n']) - (m_k**2)
+        num += s['n'] * (m_k - global_mean)**2
+        den += s['n'] * v_k
+    
+    scores = num / (den + 1e-9)
+    return pd.Series(scores, index=feature_cols).sort_values(ascending=False)
+
+# --- BPSO PROBLEM CLASS ---
 
 class SVMFeatureSelection(Problem):
     def __init__(self, X_train, y_train, alpha=0.99, n_estimators=10):
         super().__init__(dimension=X_train.shape[1], lower=0, upper=1)
-        self.X_train = X_train
-        self.y_train = y_train
+        self.X_train, self.y_train = X_train, y_train
         self.alpha = alpha
         self.n_estimators = n_estimators
 
     def _evaluate(self, x):
         selected = x > 0.5
-        num_selected = selected.sum()
-        if num_selected == 0:
+        if selected.sum() == 0: return 1.0
+        
+        clf = OneVsRestClassifier(BaggingClassifier(
+            LinearSVC(dual=False), n_jobs=-1, n_estimators=self.n_estimators, max_samples=1.0/self.n_estimators
+        ))
+        
+        # Accuracy via 3-fold CV on the narrow RAM-resident slice
+        try:
+            acc = cross_val_score(clf, self.X_train[:, selected], self.y_train, cv=3).mean()
+        except:
             return 1.0
-        clf = OneVsRestClassifier(
-            BaggingClassifier(
-                LinearSVC(dual=False), 
-                n_jobs=-1, 
-                n_estimators=self.n_estimators, 
-                max_samples=1.0/self.n_estimators
-            ), 
-            n_jobs=-1
-        )
-
-        # Cross-validation score
-        accuracy = cross_val_score(clf, self.X_train[:, selected], self.y_train, cv=3, n_jobs=-1).mean()
-        score = 1 - accuracy
-        num_features = self.X_train.shape[1]
-        
-        # Multiobjective function: Minimize error + Minimize feature count
-        return self.alpha * score + (1 - self.alpha) * (num_selected / num_features)
-
-def run_bpso_workflow(df, target_col='class', alpha=0.99, max_iters=100, population_size=30, seed=1234, n_estimators=10):
-    """
-    Runs the BPSO feature selection workflow.
-    Accepts DataFrame or Iterator[DataFrame].
-    Returns Iterator[DataFrame] with selected features.
-    """
-    
-    # 0. Handle Iterator -> Full DataFrame
-    if isinstance(df, Iterable) and not isinstance(df, pd.DataFrame):
-        print("Consuming DataFrame iterator for BPSO...")
-        df = pd.concat(df, ignore_index=True)
-
-    # Validation
-    if target_col not in df.columns:
-        raise ValueError(f"Target column '{target_col}' not found in dataset columns: {df.columns.tolist()}")
-
-    y = df[target_col].to_numpy()
-    X = df.drop(target_col, axis=1).values
-    feature_names = df.drop(target_col, axis=1).columns.values
-
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, stratify=y, random_state=seed)
-
-    print(f"Starting BPSO with {X.shape[1]} features...")
-    problem = SVMFeatureSelection(X_train, y_train, alpha=alpha, n_estimators=n_estimators)
-    task = Task(problem, max_iters=max_iters)
-    algorithm = ParticleSwarmOptimization(population_size=population_size, seed=seed)
-    
-    best_features_raw, _ = algorithm.run(task)
-    selected_mask = best_features_raw > 0.5
-    
-    selected_feature_names = feature_names[selected_mask]
-    print(f"Number of selected features: {selected_mask.sum()}")
-    print(f"Selected features: {', '.join(selected_feature_names)}")
-
-    # Final evaluation
-    model_selected = OneVsRestClassifier(
-        BaggingClassifier(
-            LinearSVC(dual=False), 
-            n_jobs=1, 
-            n_estimators=n_estimators, 
-            max_samples=1.0/n_estimators
-        ), 
-        n_jobs=1
-    )
-    
-    # Check if any features selected
-    if selected_mask.sum() > 0:
-        model_selected.fit(X_train[:, selected_mask], y_train)
-        test_score = model_selected.score(X_test[:, selected_mask], y_test)
-        cv_score = cross_val_score(model_selected, X_test[:, selected_mask], y_test, cv=5, n_jobs=1).mean()
-        
-        print(f"Subset accuracy on test: {test_score:.4f}")
-        print(f"Subset CV accuracy on test: {cv_score:.4f}")
-        
-        # Prepare result dataframe
-        df_red = df[list(selected_feature_names) + [target_col]].copy()
-    else:
-        print("Warning: No features selected by BPSO!")
-        df_red = df[[target_col]].copy()
-
-    # Removed CSV saving logic
-
-    return [df_red]
-
-def main():
-    parser = argparse.ArgumentParser(description='Binary Particle Swarm Optimization (BPSO) for Feature Selection')
-    parser.add_argument('--dataset', type=str, default='sample_CA_post_variance.csv', help='Input CSV dataset')
-    parser.add_argument('--target', type=str, default='class', help='Target column name')
-    parser.add_argument('--alpha', type=float, default=0.99, help='Weight for accuracy vs feature count (default: 0.99)')
-    parser.add_argument('--iters', type=int, default=100, help='Maximum PSO iterations (default: 100)')
-    parser.add_argument('--pop', type=int, default=30, help='PSO population size (default: 30)')
-    parser.add_argument('--seed', type=int, default=1234, help='Random seed')
-    parser.add_argument('--estimators', type=int, default=10, help='Number of bagging estimators')
-
-    args = parser.parse_args()
-
-    if not os.path.exists(args.dataset):
-        print(f"Error: Dataset {args.dataset} not found.")
-        return
-
-    print(f"Loading dataset: {args.dataset}")
-    df_iter = [pd.read_csv(args.dataset)] # Simulate iterator
-
-    try:
-        result_iter = run_bpso_workflow(
-            df=df_iter,
-            target_col=args.target,
-            alpha=args.alpha,
-            max_iters=args.iters,
-            population_size=args.pop,
-            seed=args.seed,
-            n_estimators=args.estimators
-        )
-        
-        for res_df in result_iter:
-            print(f"BPSO completed. Result shape: {res_df.shape}")
-            # res_df.to_csv('bpso_result.csv', index=False)
             
-    except ValueError as e:
-        print(f"Error: {e}")
+        return self.alpha * (1 - acc) + (1 - self.alpha) * (selected.sum() / self.dimension)
 
-if __name__ == '__main__':
-    main()
+# --- MAIN PIPELINE ---
+
+def run_h5_bpso_pipeline(h5_path, target_col, dataset_name='data', candidate_limit=200, bpso_iters=50):
+    """
+    1. Streams H5 to find top 200 candidate features (Fisher).
+    2. Loads only those 200 features into RAM.
+    3. Runs BPSO to find the best subset.
+    """
+    # 1. Narrow the search space (Filter)
+    fisher_scores = compute_streaming_fisher(h5_path, target_col, dataset_name)
+    candidates = fisher_scores.index[:candidate_limit].tolist()
+    
+    # 2. Load Narrow Slice into RAM (Pass 2)
+    print(f"Loading top {candidate_limit} candidates into RAM for BPSO...")
+    with h5py.File(h5_path, 'r') as f:
+        all_cols = list(f[dataset_name].attrs.get('column_names', []))
+        indices = [all_cols.index(c) for c in candidates]
+        y_idx = all_cols.index(target_col)
+        
+        X_narrow = f[dataset_name][:, indices]
+        y = f[dataset_name][:, y_idx]
+
+    X_train, X_test, y_train, y_test = train_test_split(X_narrow, y, test_size=0.3, stratify=y)
+
+    # 3. Run BPSO
+    print(f"Running BPSO on {candidate_limit} candidate features...")
+    problem = SVMFeatureSelection(X_train, y_train)
+    task = Task(problem, max_iters=bpso_iters)
+    algorithm = ParticleSwarmOptimization(population_size=20)
+    
+    best_x, _ = algorithm.run(task)
+    final_mask = best_x > 0.5
+    final_features = [candidates[i] for i, m in enumerate(final_mask) if m]
+    
+    print(f"BPSO selected {len(final_features)} elite features.")
+
+    # 4. Return the Mutated Result
+    final_df = pd.DataFrame(X_narrow[:, final_mask], columns=final_features)
+    final_df[target_col] = y
+    
+    return final_df
+
+if __name__ == "__main__":
+    # df_final = run_h5_bpso_pipeline('data.h5', 'class')
+    pass

@@ -1,161 +1,153 @@
-import amino_fast_mod as amino
 import numpy as np
 import pandas as pd
+import h5py
 import gc
-import argparse
-import os
-from sklearn.feature_selection import SelectKBest, chi2
+import matplotlib.pyplot as plt
 from kneed import KneeLocator
-from collections.abc import Iterable
+from sklearn.feature_selection import chi2
+import amino_fast_mod as amino
 
-def calculate_chi_scores(df, target_col='class', q=5):
-    """
-    Discretizes continuous variables and calculates Chi-Squared scores.
-    """
-    print(f"Discretizing features into {q} bins and calculating Chi-Squared scores...")
-    
-    # 1. Separate features and target
-    X_cont = df.drop(columns=[target_col])
-    y = df[target_col]
-    
-    # 2. Binning (Quantile-based)
-    # Check if columns differ to avoid "Bin edges must be unique" error
-    binned_columns = {col: pd.qcut(X_cont[col].rank(method='first'), q=q, labels=False) for col in X_cont}
-    binned_df = pd.DataFrame(binned_columns)
-    
-    # 3. Calculate Chi-Squared scores
-    test = SelectKBest(score_func=chi2, k='all')
-    test.fit(binned_df, y)
-    
-    chi_scores = test.scores_
-    # Sort indices by scores in descending order
-    sorted_indices = np.argsort(chi_scores)[::-1]
-    sorted_scores = chi_scores[sorted_indices]
-    
-    return chi_scores, sorted_indices, sorted_scores
+# --- CONFIGURATION ---
+METADATA_COLS = {'construct', 'subconstruct', 'replica', 'frame_number'}
 
-def find_optimal_n_feat(sorted_scores, S=100, curve='convex', direction='decreasing'):
-    """
-    Uses KneeLocator to find the elbow point in sorted Chi-Squared scores.
-    """
-    print("Finding optimal number of features using Kneedle algorithm...")
-    x = range(1, len(sorted_scores) + 1)
-    
-    knee_locator = KneeLocator(x, sorted_scores, curve=curve, direction=direction, S=S)
-    knee_point = knee_locator.knee
-    
-    print(f"The knee point is at nFeat = {knee_point}, with a Chi score is: {knee_locator.knee_y}")
-    return knee_point
-
-def prepare_amino_input(df_selected):
-    """
-    Converts DataFrame columns to amino.OrderParameter objects.
-    """
-    print(f"Preparing {len(df_selected.columns)} features for AMINO...")
-    gc.collect()
-    all_ops = []
-    for col in df_selected.columns:
-        all_ops.append(amino.OrderParameter(col, df_selected[col].tolist()))
-    
-    print(f"Created {len(all_ops)} OrderParameters.")
-    return all_ops
-
-def run_amino(all_ops, max_outputs=10, bins=30):
-    """
-    Runs the AMINO algorithm to find the final reduced set of features.
-    """
-    print(f"Running AMINO with max_outputs={max_outputs}, bins={bins}...")
-    gc.collect()
-    # Explicitly disable file output by passing None if supported, or just ignore the file it creates later
-    # The modified amino_fast_mod might not support silencing the distortion file easily 
-    # without a specific flag if the library hardcodes it.
-    # Assuming standard amino_fast_mod behavior or minimal wrapper.
-    # We set distortion_filename to None if possible to avoid writing, 
-    # but based on previous code it was 'distortion_array'. 
-    # If the user requested NO distortion file, we can try passing None or a dummy.
-    # However, to be safe with unknown library internals, we just let it run.
-    # If the signature allows distortion_filename, we pass it.
-    final_ops = amino.find_ops(all_ops, max_outputs, bins, distortion_filename=None)
-    
-    print("\nAMINO selected features:")
-    for op in final_ops:
-        print(op)
-            
-    return final_ops
-
-def run_chi_amino_workflow(df, target_col='class', max_outputs_amino=10, bins_amino=30):
-    """
-    Orchestrates the Chi-Squared AMINO feature selection workflow.
-    Accepts a DataFrame or an iterator of DataFrames.
-    Returns an iterator yielding the processed DataFrame with selected features.
-    """
-    
-    # 0. Handle Iterator -> Full DataFrame
-    if isinstance(df, Iterable) and not isinstance(df, pd.DataFrame):
-        print("Consuming DataFrame iterator for feature selection...")
-        df = pd.concat(df, ignore_index=True)
+def h5_chunk_iterator(h5_path, dataset_name='data', chunk_size=10000):
+    """Generates DataFrame chunks from an H5 file using memory-efficient slicing."""
+    with h5py.File(h5_path, 'r') as f:
+        dataset = f[dataset_name]
+        total_rows = dataset.shape[0]
+        # Attempt to get column names from attributes, else generic names
+        column_names = f[dataset_name].attrs.get('column_names')
+        if column_names is None:
+            column_names = [f'feature_{i}' for i in range(dataset.shape[1])]
         
-    # Validation: Check for target column
-    if target_col not in df.columns:
-        raise ValueError(f"Target column '{target_col}' not found in dataset columns: {df.columns.tolist()}")
+        for i in range(0, total_rows, chunk_size):
+            end = min(i + chunk_size, total_rows)
+            yield pd.DataFrame(dataset[i:end], columns=column_names)
 
-    # 1. Calculate Chi-Squared Scores
-    chi_scores, sorted_indices, sorted_scores = calculate_chi_scores(df, target_col)
-    
-    # 2. Find optimal number of features (Kneedle)
-    n_feat_optimal = find_optimal_n_feat(sorted_scores)
-    
-    # 3. Reduce features for AMINO (on original continuous data)
-    X_orig = df.drop(columns=[target_col])
-    # Select top N features based on sorted indices
-    selected_feature_names = X_orig.columns[sorted_indices[0:n_feat_optimal]]
-    reduced_X = X_orig[selected_feature_names]
-    
-    # 4. Prepare OPs
-    all_ops = prepare_amino_input(reduced_X)
-    
-    # 5. Run AMINO
-    final_ops = run_amino(all_ops, max_outputs=max_outputs_amino, bins=bins_amino)
-    
-    # 6. Final preparation
-    final_col_names = [str(op) for op in final_ops]
-    df_amino = X_orig[final_col_names].copy()
-    df_amino[target_col] = df[target_col].values
-    
-    # Return as an iterator (yielding the single result dataframe)
-    return [df_amino]
+# --- PASS 1: STREAMING STATISTICS ---
 
-def main():
-    parser = argparse.ArgumentParser(description='Refactored Chi-Squared AMINO Feature Selection')
-    parser.add_argument('--dataset', type=str, default='sample_CA_post_variance.csv', help='Input CSV dataset')
-    parser.add_argument('--target', type=str, default='class', help='Target column name')
-    parser.add_argument('--max_outputs', type=int, default=10, help='Max outputs for AMINO')
-    parser.add_argument('--bins', type=int, default=30, help='Number of bins for AMINO')
+def compute_pass1_stats(h5_path, target_col, dataset_name='data', chunk_size=10000, q_bins=5):
+    """
+    Computes Variance and Chi-Squared contingency tables in a single pass over the file.
+    """
+    print("Starting Pass 1: Computing Variance and Chi-Squared statistics...")
     
-    args = parser.parse_args()
+    # Variance (Chan's Algorithm) State
+    n_a = 0
+    mean_a = None
+    m2_a = None
     
-    if not os.path.exists(args.dataset):
-        print(f"Error: Dataset {args.dataset} not found.")
-        return
-
-    print(f"Loading dataset: {args.dataset}")
-    df_iter = [pd.read_csv(args.dataset)] # Simulate iterator for main execution
+    # Chi-Squared (Contingency Tables) State
+    global_chi_tables = {}
     
-    try:
-        result_iter = run_chi_amino_workflow(
-            df=df_iter,
-            target_col=args.target,
-            max_outputs_amino=args.max_outputs,
-            bins_amino=args.bins
-        )
+    for chunk in h5_chunk_iterator(h5_path, dataset_name, chunk_size):
+        # 1. Setup Columns
+        feature_cols = [c for c in chunk.columns if c not in METADATA_COLS and c != target_col]
+        data_b = chunk[feature_cols].values
+        y_b = chunk[target_col]
+        n_b = data_b.shape[0]
         
-        for result_df in result_iter:
-            print(f"Workflow completed. Resulting shape: {result_df.shape}")
-            # Optional: Save here if running as main script, or just dry run
-            # result_df.to_csv('chi_amino_result.csv', index=False)
-            
-    except ValueError as e:
-        print(f"Error: {e}")
+        # --- Update Variance (Online) ---
+        mean_b = np.mean(data_b, axis=0)
+        m2_b = np.var(data_b, axis=0, ddof=0) * n_b
+        
+        if n_a == 0:
+            n_a, mean_a, m2_a = n_b, mean_b, m2_b
+        else:
+            n_ab = n_a + n_b
+            delta = mean_b - mean_a
+            mean_a = mean_a + delta * (n_b / n_ab)
+            m2_a = m2_a + m2_b + (delta ** 2) * (n_a * n_b / n_ab)
+            n_a = n_ab
+        
+        # --- Update Chi-Squared Counts ---
+        for col in feature_cols:
+            # Rank-based discretization per chunk
+            binned = pd.qcut(chunk[col].rank(method='first'), q=q_bins, labels=False)
+            ct = pd.crosstab(binned, y_b)
+            if col not in global_chi_tables:
+                global_chi_tables[col] = ct
+            else:
+                global_chi_tables[col] = global_chi_tables[col].add(ct, fill_value=0)
+
+    # Finalize Variance
+    variance_series = pd.Series(m2_a / n_a, index=feature_cols)
+    
+    # Finalize Chi-Squared Scores
+    chi_scores = {}
+    for col, ct in global_chi_tables.items():
+        observed = ct.values
+        row_sums, col_sums = observed.sum(axis=1, keepdims=True), observed.sum(axis=0, keepdims=True)
+        expected = (row_sums @ col_sums) / observed.sum()
+        expected[expected == 0] = 1e-9
+        chi_scores[col] = np.sum((observed - expected)**2 / expected)
+    
+    chi_series = pd.Series(chi_scores).sort_values(ascending=False)
+    
+    return variance_series, chi_series
+
+# --- UTILITIES ---
+
+def get_threshold_features(series, label="Statistic"):
+    """Finds the knee point and returns features above that threshold."""
+    y = sorted(series.values, reverse=True)
+    kn = KneeLocator(range(len(y)), y, curve='convex', direction='decreasing')
+    threshold = y[kn.knee] if kn.knee else 0.0
+    selected = series[series >= threshold].index.tolist()
+    print(f"{label} Knee: {threshold:.4f} | Kept {len(selected)} features.")
+    return selected
+
+# --- MAIN WORKFLOW ---
+
+def run_feature_selection_pipeline(h5_path, target_col, dataset_name='data', max_amino=10):
+    """
+    Complete Pipeline:
+    1. Pass 1 Variance/Chi2 scan.
+    2. Knee Detection to filter noise.
+    3. Pass 2 Selective Load of top features.
+    4. AMINO redundancy reduction.
+    """
+    
+    # 1. Pass 1: Gather global stats
+    var_s, chi_s = compute_pass1_stats(h5_path, target_col, dataset_name)
+    
+    # 2. Thresholding
+    high_var_features = get_threshold_features(var_s, "Variance")
+    high_chi_features = get_threshold_features(chi_s, "Chi-Squared")
+    
+    # Intersect criteria (Must have variance AND predictive power)
+    candidate_features = list(set(high_var_features) & set(high_chi_features))
+    print(f"Candidate features for AMINO: {len(candidate_features)}")
+
+    # 3. Pass 2: Load ONLY the survivors into RAM
+    print("Pass 2: Loading candidate features for AMINO...")
+    with h5py.File(h5_path, 'r') as f:
+        all_cols = list(f[dataset_name].attrs.get('column_names', []))
+        indices = [all_cols.index(c) for c in candidate_features]
+        target_idx = all_cols.index(target_col)
+        
+        # Load vertical slice
+        reduced_data = f[dataset_name][:, indices]
+        y_data = f[dataset_name][:, target_idx]
+        
+    df_amino_input = pd.DataFrame(reduced_data, columns=candidate_features)
+    gc.collect()
+
+    # 4. AMINO Optimization
+    print(f"Running AMINO (Max outputs: {max_amino})...")
+    ops = [amino.OrderParameter(name, df_amino_input[name].tolist()) for name in candidate_features]
+    final_ops = amino.find_ops(ops, max_outputs=max_amino, bins=30, distortion_filename=None)
+    final_feature_names = [str(op) for op in final_ops]
+
+    # 5. Final Result
+    final_df = df_amino_input[final_feature_names].copy()
+    final_df[target_col] = y_data
+    
+    print(f"Pipeline Complete. Final Shape: {final_df.shape}")
+    return final_df
 
 if __name__ == "__main__":
-    main()
+    # Example usage:
+    # result_df = run_feature_selection_pipeline('input_data.h5', target_col='class')
+    # result_df.to_csv('final_features.csv', index=False)
+    pass
