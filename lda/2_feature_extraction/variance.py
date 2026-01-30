@@ -1,194 +1,98 @@
-### STEP 0. Import libraries
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from kneed import KneeLocator
-import sys
-import os
-
-
+import h5py
 
 METADATA_COLS = {'construct', 'subconstruct', 'replica', 'frame_number'}
 
+def h5_chunk_iterator(h5_path, dataset_name='data', chunk_size=10000):
+    """
+    Generator that yields chunks of an HDF5 dataset as Pandas DataFrames.
+    """
+    with h5py.File(h5_path, 'r') as f:
+        dataset = f[dataset_name]
+        total_rows = dataset.shape[0]
+        # Assuming the first dimension is rows and column names are stored in attributes 
+        # or we use the column index if names aren't available.
+        column_names = f[dataset_name].attrs.get('column_names', [f'feature_{i}' for i in range(dataset.shape[1])])
+        
+        for i in range(0, total_rows, chunk_size):
+            end = min(i + chunk_size, total_rows)
+            yield pd.DataFrame(dataset[i:end], columns=column_names)
+
 def compute_streaming_variance(df_iterator):
     """
-    Calculates variance across multiple DataFrames iteratively.
-    
-    Args:
-        df_iterator: An iterator yielding pandas DataFrames.
-        
-    Returns:
-        pd.Series: Column-wise variances, excluding metadata.
+    Calculates variance across multiple DataFrames iteratively using Chan's online algorithm.
     """
-    # State variables for Chan's algorithm
     n_a = 0
     mean_a = None
-    m2_a = None  # Sum of squares of differences from the mean (SSE)
-
-    first_chunk = True
-
-    if df_iterator is None:
-        return pd.Series(dtype=float)
+    m2_a = None  
 
     for df in df_iterator:
-        # Filter feature columns
-        if first_chunk:
-            feature_cols = [c for c in df.columns if c not in METADATA_COLS]
-            # Initialize state with zeros for appropriate shape
-            num_features = len(feature_cols)
-            mean_a = np.zeros(num_features)
-            m2_a = np.zeros(num_features)
-            first_chunk = False
-        
-        # Get chunk data
+        feature_cols = [c for c in df.columns if c not in METADATA_COLS]
         data_b = df[feature_cols].values
         n_b = data_b.shape[0]
         
-        if n_b == 0:
-            continue
+        if n_b == 0: continue
 
-        # Calculate statistics for the current chunk (B)
         mean_b = np.mean(data_b, axis=0)
-        # M2_b = sum((x - mean_b)^2)
         m2_b = np.var(data_b, axis=0, ddof=0) * n_b
 
-        # Combine with existing statistics (A) using Chan's algorithm
-        # Refer: https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Parallel_algorithm
-        n_ab = n_a + n_b
-        
         if n_a == 0:
-            # First non-empty chunk becomes the base
-            n_a = n_b
-            mean_a = mean_b
-            m2_a = m2_b
+            n_a, mean_a, m2_a = n_b, mean_b, m2_b
         else:
+            n_ab = n_a + n_b
             delta = mean_b - mean_a
-            
-            # Update mean
             mean_a = mean_a + delta * (n_b / n_ab)
-            
-            # Update M2 (Sum of Squares)
             m2_a = m2_a + m2_b + (delta ** 2) * (n_a * n_b / n_ab)
-            
-            # Update count
             n_a = n_ab
 
-    if n_a == 0:
-        return pd.Series(dtype=float)
-
-    # Final variance = M2 / N (Population Variance) or M2 / (N-1) (Sample Variance)
-    # Using Population Variance (ddof=0) to match standard numpy output usually expected for large data
-    variance = m2_a / n_a
+    if n_a == 0: return pd.Series(dtype=float)
     
+    variance = m2_a / n_a
     return pd.Series(variance, index=feature_cols)
 
-def get_knee_point(values):
-    """
-    Finds the knee point in the sorted variance values using the Kneedle algorithm.
-    Returns the variance threshold corresponding to the knee.
-    """
-    if values.empty:
-        return 0.0
-        
-    y = sorted(values.values, reverse=True)
+def get_knee_point(variance_series):
+    """Finds the elbow/knee in the variance distribution."""
+    y = sorted(variance_series.values, reverse=True)
     x = range(len(y))
     
-    # Use KneeLocator to find the "elbow"
-    # curve='convex' and direction='decreasing' are typical for scree plots / variance distributions
-    if KneeLocator is None:
-        print("Error: 'kneed' library is not installed. unique knee detection cannot be performed.")
-        print("Please install it via 'pip install kneed' or provide a manual threshold.")
-        return 0.0
-        
-    knee_locator = KneeLocator(x, y, curve='convex', direction='decreasing')
-    knee_idx = knee_locator.knee
-    
-    if knee_idx is not None:
-        threshold = y[knee_idx]
-        print(f"Knee found at index {knee_idx}, variance threshold: {threshold:.4f}")
+    kn = KneeLocator(x, y, curve='convex', direction='decreasing')
+    if kn.knee is not None:
+        threshold = y[kn.knee]
         return threshold
-    else:
-        print("No knee point found. Returning 0.0.")
-        return 0.0
+    return 0.0
 
-def plot_variance(variance_series, threshold):
+def h5_variance_filter_pipeline(h5_path, dataset_name='data', chunk_size=10000):
     """
-    Plots the variance of features and marks the threshold.
+    Two-pass memory-efficient pipeline.
+    Pass 1: Calculate Variance
+    Pass 2: Yield filtered data
     """
-    variance_values = variance_series.sort_values(ascending=False)
+    # PASS 1
+    print("Pass 1: Analyzing feature variance...")
+    var_iter = h5_chunk_iterator(h5_path, dataset_name, chunk_size)
+    variance_series = compute_streaming_variance(var_iter)
     
-    plt.figure(figsize=(10, 6))
-    plt.plot(range(len(variance_values)), variance_values.values, label='Variance')
-    plt.axhline(y=threshold, color='r', linestyle='--', label=f'Threshold ({threshold:.4f})')
+    threshold = get_knee_point(variance_series)
+    selected_features = variance_series[variance_series > threshold].index.tolist()
     
-    plt.xlabel('Number of Features (sorted)', fontsize=14)
-    plt.ylabel('Variance (Å²)', fontsize=14)
-    plt.title('Variance vs. Number of Features', fontweight='bold', fontsize=18)
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.xticks(fontsize=12)
-    plt.yticks(fontsize=12)
-    plt.tight_layout()
-    # plt.show() # Blocking in some environments, save or show depending on context
-    # saving might be safer if running headless
-    plt.savefig('variance_plot.png')
-    print("Variance plot saved to variance_plot.png")
+    print(f"Threshold: {threshold:.6f} | Retained: {len(selected_features)} features.")
 
-def calculate_features_with_low_variance(data, threshold=None):
-    """
-    Calculates feature variances from the provided data iterator, finds threshold (if None), 
-    and returns the list of feature names with variance > threshold.
-    
-    Args:
-        data: An iterator yielding pandas DataFrames.
-        threshold (float, optional): variance threshold to cut off at. 
-                                     If None, uses knee detection.
-        
-    Returns:
-        tuple: (selected_features_list, threshold_used)
-    """
-    # 1. Compute Variance
-    print("Computing streaming variance...")
-    variance_series = compute_streaming_variance(data)
-    
-    if variance_series.empty:
-        print("Variance calculation failed or returned empty.")
-        return [], 0.0
+    # PASS 2 (Generator)
+    # Note: We open the iterator again to stream the filtered data
+    for chunk in h5_chunk_iterator(h5_path, dataset_name, chunk_size):
+        # Identify columns to keep (Features > threshold + Metadata)
+        keep = [c for c in chunk.columns if c in selected_features or c in METADATA_COLS]
+        yield chunk[keep]
 
-    # 2. Determine Threshold
-    if threshold is None:
-        threshold = get_knee_point(variance_series)
-    
-    # 3. Plot
-    plot_variance(variance_series, threshold)
-    
-    # 4. Identify Features
-    high_var_features = variance_series[variance_series > threshold].index.tolist()
-    print(f"Retaining {len(high_var_features)} features with variance > {threshold}")
-    
-    return high_var_features, threshold
-
-def remove_low_variance_features(data, selected_features):
-    """
-    Actually filters the provided data to keep only the selected features.
-    If data is a single DataFrame, returns a filtered DataFrame.
-    If data is an iterator, returns a generator yielding filtered DataFrames.
-    
-    Always preserves metadata columns if they exist.
-    """
-    def filter_df(df):
-        # Identify which columns to keep (selected features + any metadata present)
-        cols_to_keep = [c for c in df.columns if c in selected_features or c in METADATA_COLS]
-        return df[cols_to_keep]
-
-    if isinstance(data, pd.DataFrame):
-        return filter_df(data)
-    else:
-        # Assume it's an iterator/generator
-        return (filter_df(df) for df in data)
-
+# --- Example Usage ---
 if __name__ == "__main__":
-    # Example usage
-    # This requires an iterator to be passed in, so we can't run it standalone easily without mocking
-    print("This script is now a library function. Import and call 'calculate_features_with_low_variance(data_iterator)'")
-
+    # This yields filtered chunks one by one without ever loading the full file into RAM
+    processed_stream = h5_variance_filter_pipeline('your_data.h5')
+    
+    for filtered_chunk in processed_stream:
+        # Perform your final mutation or analysis here
+        # e.g., send_to_model(filtered_chunk)
+        print(f"Processed chunk with shape: {filtered_chunk.shape}")

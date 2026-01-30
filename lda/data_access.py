@@ -2,6 +2,7 @@ import os
 import numpy as np
 import pandas as pd
 from pathlib import Path
+import h5py
 
 # BASE_DIR should be set to the base_directory_of_analysis mentioned in NEW_README.md
 # It can be overriden by the DATA_BASE_DIR environment variable.
@@ -153,6 +154,80 @@ def data_iterator(base_dir=BASE_DIR, chunk_size=None, residue_list=DEFAULT_RESID
         except Exception as e:
             print(f"Error processing {file_info['path']}: {e}")
             continue
+
+def load_h5_data(h5_path, dataset_name='data', chunk_size=None):
+    """
+    Load data from HDF5 file with optional chunking for large datasets.
+    
+    Args:
+        h5_path (str): Path to .h5 file.
+        dataset_name (str): Name of dataset within the .h5 file (default: 'data').
+        chunk_size (int): If provided, yields chunks of this size. If None, loads all data.
+    
+    Yields (if chunk_size given):
+        pd.DataFrame: Chunk of data.
+    
+    Returns (if chunk_size is None):
+        pd.DataFrame: Full dataset (all data loaded into RAM).
+    """
+    if chunk_size is None:
+        # Load everything at once
+        return pd.read_hdf(h5_path, dataset_name)
+    else:
+        # Yield chunks to reduce peak RAM usage
+        store = pd.HDFStore(h5_path, mode='r')
+        n_rows = store.get_storer(dataset_name).nrows
+        
+        for start in range(0, n_rows, chunk_size):
+            stop = min(start + chunk_size, n_rows)
+            chunk = store.select(dataset_name, start=start, stop=stop)
+            yield chunk
+        
+        store.close()
+
+
+def save_h5_data(data, h5_path, dataset_name='data', mode='w', format='table'):
+    """
+    Save data to HDF5 file.
+    
+    Args:
+        data (pd.DataFrame or np.ndarray): Data to save.
+        h5_path (str): Path to output .h5 file.
+        dataset_name (str): Name for dataset within .h5 file.
+        mode (str): 'w' to overwrite, 'a' to append.
+        format (str): 'fixed' (faster, no query) or 'table' (slower, queryable).
+    """
+    if isinstance(data, np.ndarray):
+        data = pd.DataFrame(data)
+    
+    data.to_hdf(h5_path, dataset_name, mode=mode, format=format, complevel=9, complib='blosc')
+    print(f"Saved {data.shape} to {h5_path}[{dataset_name}]")
+
+
+def get_h5_info(h5_path):
+    """
+    Get basic info about .h5 file structure and dataset sizes.
+    
+    Args:
+        h5_path (str): Path to .h5 file.
+    
+    Returns:
+        dict: File information including datasets and their shapes.
+    """
+    info = {}
+    with h5py.File(h5_path, 'r') as f:
+        def visit_func(name, obj):
+            if isinstance(obj, h5py.Dataset):
+                info[name] = {
+                    'shape': obj.shape,
+                    'dtype': str(obj.dtype),
+                    'size_mb': obj.nbytes / (1024 ** 2)
+                }
+        
+        f.visititems(visit_func)
+    
+    return info
+
 
 if __name__ == "__main__":
     # Quick test/validation script
