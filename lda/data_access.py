@@ -34,22 +34,22 @@ def get_residue_feature_names(residue_list=DEFAULT_RESIDUE_LIST):
 
 def get_data_files(base_dir=BASE_DIR):
     """
-    Finds all pairwise_dist.npy files and extracts metadata.
+    Finds all pairwise_dist.h5 files and extracts metadata.
     
     Expected structure:
     base_dir/
         ├── construct/
         │   ├── subconstruct/
-        │   │   ├── {replica}_s{start}_e{end}_pairwise_dist.npy
+        │   │   ├── {replica}_pairwise_dist.h5
     """
     data_files = []
     base_path = Path(base_dir)
     
-    # glob pattern to match the described file structure
-    for npy_file in base_path.glob("**/*_pairwise_dist.npy"):
+    # glob pattern to match .h5 files
+    for h5_file in base_path.glob("**/*_pairwise_dist.h5"):
         # Relative path parts: (construct, subconstruct, filename)
         try:
-            rel_path = npy_file.relative_to(base_path)
+            rel_path = h5_file.relative_to(base_path)
             parts = rel_path.parts
             
             if len(parts) >= 3:
@@ -57,17 +57,9 @@ def get_data_files(base_dir=BASE_DIR):
                 subconstruct = parts[1]
                 filename = parts[-1]
                 
-                # Extract metadata from filename (e.g., "1_s0001_e0150_pairwise_dist.npy")
+                # Extract replica from filename (e.g., "1_pairwise_dist.h5")
                 file_parts = filename.split("_")
                 replica_str = file_parts[0]
-                
-                # Parse start frame (e.g., "s0001" -> 1)
-                start_frame = 1
-                if len(file_parts) > 1 and file_parts[1].startswith("s"):
-                    try:
-                        start_frame = int(file_parts[1][1:])
-                    except ValueError:
-                        pass
 
                 try:
                     replica = int(replica_str)
@@ -75,82 +67,73 @@ def get_data_files(base_dir=BASE_DIR):
                     replica = replica_str
                 
                 data_files.append({
-                    "path": str(npy_file),
+                    "path": str(h5_file),
                     "construct": construct,
                     "subconstruct": subconstruct,
-                    "replica": replica,
-                    "start_frame": start_frame
+                    "replica": replica
                 })
         except ValueError:
             # Handle cases where path logic might fail if not under base_dir
             continue
             
-    # Sort files by (construct, subconstruct, replica, start_frame)
-    data_files.sort(key=lambda x: (x["construct"], x["subconstruct"], str(x["replica"]), x["start_frame"]))
+    # Sort files by (construct, subconstruct, replica)
+    data_files.sort(key=lambda x: (x["construct"], x["subconstruct"], str(x["replica"])))
     return data_files
 
-def data_iterator(base_dir=BASE_DIR, chunk_size=None, residue_list=DEFAULT_RESIDUE_LIST, keep_features=None):
+def data_iterator(base_dir=BASE_DIR, chunk_size=10000, dataset_name='data'):
     """
-    Iterative data provider that yields DataFrames with metadata.
+    Iterative data provider that yields DataFrames from H5 files with metadata.
+    Reads H5 files chunk-by-chunk to avoid loading entire dataset into RAM.
     
     Args:
-        base_dir: Root directory to search for data.
-        chunk_size: If provided, yields DataFrames in chunks of this many rows.
-        residue_list: List of residues used to generate pairwise distance columns.
-        keep_features: List of feature names to keep. If None, keeps all.
+        base_dir: Root directory to search for .h5 files.
+        chunk_size: Number of rows to read per chunk (default: 10000).
+        dataset_name: Name of the dataset within each H5 file (default: 'data').
     
     Yields:
-        pd.DataFrame: A DataFrame with pairwise distance data, metadata, and frame numbers.
+        pd.DataFrame: A DataFrame chunk with pairwise distance data and metadata columns
+                     (construct, subconstruct, replica, frame_number).
     """
     data_files = get_data_files(base_dir)
-    feature_names = get_residue_feature_names(residue_list)
     
     if not data_files:
-        print(f"No data files found in {base_dir}")
+        print(f"No .h5 data files found in {base_dir}")
         return
-
-    metadata_cols = ['construct', 'subconstruct', 'replica', 'frame_number']
-    
-    # Pre-compute columns to keep if specified
-    final_cols = None
-    if keep_features is not None:
-        # Ensure metadata columns are always included
-        final_cols = metadata_cols + [f for f in keep_features if f not in metadata_cols]
 
     for file_info in data_files:
         try:
-            data = np.load(file_info["path"], mmap_mode='r')
-            
-            # Convert to DataFrame with interpretable feature names
-            if data.shape[1] == len(feature_names):
-                df = pd.DataFrame(data, columns=feature_names)
-            else:
-                # Fallback to integer columns if mismatch, but warn
-                print(f"Warning: Data shape {data.shape[1]} doesn't match feature list {len(feature_names)} for {file_info['path']}")
-                df = pd.DataFrame(data)
-            
-            # Assign metadata
-            df['construct'] = file_info['construct']
-            df['subconstruct'] = file_info['subconstruct']
-            df['replica'] = file_info['replica']
-            
-            # Assign frame_number (1-indexed, starting from start_frame)
-            df['frame_number'] = np.arange(len(df)) + file_info['start_frame']
-            
-            # Filter columns if requested
-            if final_cols:
-                # Only keep columns that exist in the dataframe
-                # (Intersection to be safe against missing features)
-                available_cols = [c for c in final_cols if c in df.columns]
-                df = df[available_cols]
-
-            if chunk_size:
-                for i in range(0, len(df), chunk_size):
-                    # We use .copy() to ensure we don't have a view of the original mmapped data 
-                    # if we are doing further processing that might be affected.
-                    yield df.iloc[i:i+chunk_size].copy()
-            else:
-                yield df
+            with h5py.File(file_info["path"], 'r') as f:
+                if dataset_name not in f:
+                    print(f"Warning: Dataset '{dataset_name}' not found in {file_info['path']}")
+                    continue
+                
+                dataset = f[dataset_name]
+                total_rows = dataset.shape[0]
+                
+                # Get column names from attributes if available
+                column_names = dataset.attrs.get('column_names', None)
+                if column_names is None:
+                    # Generate default column names
+                    column_names = [f'feature_{i}' for i in range(dataset.shape[1])]
+                
+                # Read and yield data in chunks
+                for start_idx in range(0, total_rows, chunk_size):
+                    end_idx = min(start_idx + chunk_size, total_rows)
+                    
+                    # Read chunk from H5 file
+                    chunk_data = dataset[start_idx:end_idx]
+                    
+                    # Create DataFrame
+                    df = pd.DataFrame(chunk_data, columns=column_names)
+                    
+                    # Add metadata columns
+                    df['construct'] = file_info['construct']
+                    df['subconstruct'] = file_info['subconstruct']
+                    df['replica'] = file_info['replica']
+                    df['frame_number'] = np.arange(start_idx, end_idx) + 1  # 1-indexed
+                    
+                    yield df
+                    
         except Exception as e:
             print(f"Error processing {file_info['path']}: {e}")
             continue

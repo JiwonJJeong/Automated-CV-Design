@@ -12,30 +12,70 @@ from niapy.algorithms.basic import ParticleSwarmOptimization
 
 # --- METADATA PARSING ---
 
-def get_feature_metadata_from_h5(h5_path, dataset_name='data'):
-    """Extracts and parses residue indices from H5 attributes."""
-    with h5py.File(h5_path, 'r') as f:
-        feature_names = f[dataset_name].attrs.get('column_names', [])
+def get_feature_metadata_from_df(df, target_col='class'):
+    """Extracts and parses residue indices from DataFrame column names."""
+    # Get feature columns (exclude metadata and target)
+    metadata_cols = {'construct', 'subconstruct', 'replica', 'frame_number', target_col}
+    feature_names = [col for col in df.columns if col not in metadata_cols]
     
-    # Logic to parse 'res123.456'
-    residue_list = np.sort(np.unique(','.join([','.join(i.split("res")[1].split(".")) 
-                           for i in feature_names if "res" in i]).split(",")).astype(int))
+    # Logic to parse 'RES123_456' or 'res123.456' format
+    residue_list = []
+    for fname in feature_names:
+        if "res" in fname.lower() or "RES" in fname:
+            # Handle both 'res123.456' and 'RES123_456' formats
+            parts = fname.replace('res', '').replace('RES', '').replace('.', '_').split('_')
+            if len(parts) >= 2:
+                residue_list.extend([int(parts[0]), int(parts[1])])
     
-    f_idx1 = np.array([np.where(residue_list == int(i.split("res")[1].split(".")[0]))[0][0] 
-                       for i in feature_names if "res" in i])
-    f_idx2 = np.array([np.where(residue_list == int(i.split("res")[1].split(".")[1]))[0][0] 
-                       for i in feature_names if "res" in i])
+    residue_list = np.sort(np.unique(residue_list))
     
-    return f_idx1, f_idx2, len(residue_list), feature_names
+    # Create index mappings
+    f_idx1 = []
+    f_idx2 = []
+    for fname in feature_names:
+        if "res" in fname.lower() or "RES" in fname:
+            parts = fname.replace('res', '').replace('RES', '').replace('.', '_').split('_')
+            if len(parts) >= 2:
+                f_idx1.append(np.where(residue_list == int(parts[0]))[0][0])
+                f_idx2.append(np.where(residue_list == int(parts[1]))[0][0])
+    
+    return np.array(f_idx1), np.array(f_idx2), len(residue_list), feature_names
 
-# --- PASS 1: STREAMING FILTER (Same as Fisher/Chi2 logic) ---
+# --- PASS 1: STREAMING FISHER FILTER ---
 
-def get_candidate_features(h5_path, target_col, limit=500):
-    """Streams H5 to find top N candidates so the PSO fits in RAM."""
-    print(f"Pass 1: Filtering to top {limit} candidates via Fisher Score...")
-    # ... (Insert the compute_streaming_fisher logic from previous response) ...
-    # For brevity, assume this returns a list of column indices
-    return list(range(limit)) 
+def compute_streaming_fisher(df_iterator, target_col):
+    """Streams DataFrames to compute Fisher scores for candidate selection."""
+    print("Pass 1: Computing Fisher scores for feature filtering...")
+    stats = {}
+    feature_cols = None
+
+    for chunk in df_iterator:
+        if feature_cols is None:
+            metadata_cols = {'construct', 'subconstruct', 'replica', 'frame_number', target_col}
+            feature_cols = [c for c in chunk.columns if c not in metadata_cols]
+        
+        for label, group in chunk.groupby(target_col):
+            data = group[feature_cols].values
+            if label not in stats:
+                stats[label] = {'n': 0, 'sum': 0, 'sum_sq': 0}
+            stats[label]['n'] += data.shape[0]
+            stats[label]['sum'] += np.sum(data, axis=0)
+            stats[label]['sum_sq'] += np.sum(data**2, axis=0)
+
+    # Calculate final scores
+    total_n = sum(s['n'] for s in stats.values())
+    global_mean = sum(s['sum'] for s in stats.values()) / total_n
+    num, den = np.zeros(len(feature_cols)), np.zeros(len(feature_cols))
+    
+    for label, s in stats.items():
+        m_k = s['sum'] / s['n']
+        v_k = (s['sum_sq'] / s['n']) - (m_k**2)
+        num += s['n'] * (m_k - global_mean)**2
+        den += s['n'] * v_k
+    
+    scores = num / (den + 1e-9)
+    fisher_series = pd.Series(scores, index=feature_cols).sort_values(ascending=False)
+    return fisher_series 
 
 # --- THE PSO PROBLEM (Optimized for RAM-slice) ---
 
@@ -77,45 +117,74 @@ class SVMFeatureExpandH5(Problem):
 
 # --- MAIN ORCHESTRATOR ---
 
-def run_h5_multistage_mpso(h5_path, target_col, dims=5, candidate_limit=500):
-    # 1. Setup Metadata & Candidates
-    f_idx1, f_idx2, n_res, all_names = get_feature_metadata_from_h5(h5_path)
-    candidate_indices = get_candidate_features(h5_path, target_col, limit=candidate_limit)
+# --- MAIN PIPELINE ---
+
+def run_mpso_pipeline(df_iterator, target_col='class', dims=5, candidate_limit=500, mpso_iters=50):
+    """
+    Multi-stage MPSO feature selection with DataFrame iterator input.
     
-    # 2. Load Narrow Slice for PSO
-    with h5py.File(h5_path, 'r') as f:
-        X_candidates = f['data'][:, candidate_indices]
-        y = f['data'][:, list(all_names).index(target_col)]
-        
+    Args:
+        df_iterator: Iterator yielding DataFrames with features and target column
+        target_col: Name of the target column (default: 'class')
+        dims: Number of output dimensions for projection
+        candidate_limit: Number of top features to consider for MPSO
+        mpso_iters: Number of MPSO iterations
+    
+    Returns:
+        pd.DataFrame: Projected features + target column
+    """
+    # Convert iterator to list for two-pass processing
+    print("Collecting data from iterator...")
+    df_chunks = list(df_iterator)
+    
+    # Combine chunks for processing
+    combined_df = pd.concat(df_chunks, ignore_index=True)
+    
+    # 1. Extract feature metadata from column names
+    f_idx1, f_idx2, n_res, all_feature_names = get_feature_metadata_from_df(combined_df, target_col)
+    
+    # 2. Get candidate features via Fisher filtering
+    fisher_scores = compute_streaming_fisher(iter(df_chunks), target_col)
+    candidate_features = fisher_scores.index[:candidate_limit].tolist()
+    
+    # 3. Load narrow slice for PSO
+    print(f"Loading top {candidate_limit} candidates into RAM for MPSO...")
+    cols_to_keep = candidate_features + [target_col]
+    narrow_df = combined_df[cols_to_keep]
+    
+    X_candidates = narrow_df[candidate_features].values
+    y = narrow_df[target_col].values
+    
+    # Get indices for candidate features only
+    candidate_indices = [all_feature_names.index(c) for c in candidate_features]
+    f_idx1_candidates = f_idx1[candidate_indices]
+    f_idx2_candidates = f_idx2[candidate_indices]
+    
     X_train, X_test, y_train, y_test = train_test_split(X_candidates, y, test_size=0.3, stratify=y)
 
-    # 3. PSO Loop
-    # Available_data_map now refers to the indices of the CANDIDATES
-    cur_map = np.ones((len(candidate_indices), dims)).astype(bool)
+    # 4. PSO Loop
+    cur_map = np.ones((len(candidate_features), dims)).astype(bool)
     
-    # (Simulating one iteration for this example)
     problem = SVMFeatureExpandH5(cur_map, np.zeros_like(cur_map), X_train, y_train, 
-                                f_idx1[candidate_indices], f_idx2[candidate_indices], 
+                                f_idx1_candidates, f_idx2_candidates, 
                                 None, None, 3, 1, 10, 0.8)
     
-    best_x, _ = ParticleSwarmOptimization(population_size=30).run(Task(problem, max_iters=50))
+    best_x, _ = ParticleSwarmOptimization(population_size=30).run(Task(problem, max_iters=mpso_iters))
     final_sel = (best_x > 0.8).reshape(cur_map.shape)
 
-    # 4. Final Projection (Streaming the whole H5 file)
-    print("Projecting full dataset in chunks...")
-    projected_results = []
+    # 5. Final Projection
+    print("Projecting full dataset...")
+    projected_data = np.matmul(X_candidates, final_sel)
+    avg_projected = projected_data / np.sum(final_sel, axis=0)
     
-    with h5py.File(h5_path, 'r') as f:
-        dataset = f['data']
-        for i in range(0, dataset.shape[0], 10000):
-            chunk = dataset[i:i+10000, candidate_indices]
-            # Matrix multiply chunk by selection matrix
-            sum_chunk = np.matmul(chunk, final_sel)
-            avg_chunk = sum_chunk / np.sum(final_sel, axis=0)
-            projected_results.append(avg_chunk)
-            
-    final_data = np.vstack(projected_results)
-    df_final = pd.DataFrame(final_data, columns=[f'Dim{i}' for i in range(dims)])
+    df_final = pd.DataFrame(avg_projected, columns=[f'Dim{i}' for i in range(dims)])
     df_final[target_col] = y
     
     return df_final
+
+if __name__ == "__main__":
+    # Example usage with DataFrame iterator:
+    # from data_access import data_iterator
+    # df_iter = data_iterator(base_dir='/path/to/data', chunk_size=10000)
+    # df_final = run_mpso_pipeline(df_iter, target_col='class')
+    pass

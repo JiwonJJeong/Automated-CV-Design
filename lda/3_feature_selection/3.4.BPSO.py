@@ -25,15 +25,15 @@ def h5_chunk_iterator(h5_path, dataset_name='data', chunk_size=10000):
 
 # --- PASS 1: STREAMING FISHER (To narrow the search space for BPSO) ---
 
-def compute_streaming_fisher(h5_path, target_col, dataset_name='data'):
+def compute_streaming_fisher(df_iterator, target_col):
     """Quickly reduces thousands of features to a manageable few hundred."""
     print("Pass 1: Filtering features via Streaming Fisher Score...")
     stats = {}
     feature_cols = None
 
-    for chunk in h5_chunk_iterator(h5_path, target_col=None): # Use default iterator
+    for chunk in df_iterator:
         if feature_cols is None:
-            feature_cols = [c for c in chunk.columns if c not in {target_col, 'construct', 'replica'}]
+            feature_cols = [c for c in chunk.columns if c not in {target_col, 'construct', 'subconstruct', 'replica', 'frame_number'}]
         
         for label, group in chunk.groupby(target_col):
             data = group[feature_cols].values
@@ -84,25 +84,41 @@ class SVMFeatureSelection(Problem):
 
 # --- MAIN PIPELINE ---
 
-def run_h5_bpso_pipeline(h5_path, target_col, dataset_name='data', candidate_limit=200, bpso_iters=50):
+def run_bpso_pipeline(df_iterator, target_col='class', candidate_limit=200, bpso_iters=50):
     """
-    1. Streams H5 to find top 200 candidate features (Fisher).
-    2. Loads only those 200 features into RAM.
+    1. Streams DataFrames to find top N candidate features (Fisher).
+    2. Loads only those N features into RAM.
     3. Runs BPSO to find the best subset.
+    
+    Args:
+        df_iterator: Iterator yielding DataFrames with features and target column
+        target_col: Name of the target column (default: 'class')
+        candidate_limit: Number of top features to consider for BPSO
+        bpso_iters: Number of BPSO iterations
+    
+    Returns:
+        pd.DataFrame: Final selected features + target column
     """
+    # Convert iterator to list for two-pass processing
+    print("Collecting data from iterator...")
+    df_chunks = list(df_iterator)
+    
     # 1. Narrow the search space (Filter)
-    fisher_scores = compute_streaming_fisher(h5_path, target_col, dataset_name)
+    fisher_scores = compute_streaming_fisher(iter(df_chunks), target_col)
     candidates = fisher_scores.index[:candidate_limit].tolist()
     
     # 2. Load Narrow Slice into RAM (Pass 2)
     print(f"Loading top {candidate_limit} candidates into RAM for BPSO...")
-    with h5py.File(h5_path, 'r') as f:
-        all_cols = list(f[dataset_name].attrs.get('column_names', []))
-        indices = [all_cols.index(c) for c in candidates]
-        y_idx = all_cols.index(target_col)
-        
-        X_narrow = f[dataset_name][:, indices]
-        y = f[dataset_name][:, y_idx]
+    
+    # Combine all chunks and select candidate features + target
+    combined_df = pd.concat(df_chunks, ignore_index=True)
+    
+    # Select only candidate features and target
+    cols_to_keep = candidates + [target_col]
+    narrow_df = combined_df[cols_to_keep]
+    
+    X_narrow = narrow_df[candidates].values
+    y = narrow_df[target_col].values
 
     X_train, X_test, y_train, y_test = train_test_split(X_narrow, y, test_size=0.3, stratify=y)
 
@@ -125,5 +141,8 @@ def run_h5_bpso_pipeline(h5_path, target_col, dataset_name='data', candidate_lim
     return final_df
 
 if __name__ == "__main__":
-    # df_final = run_h5_bpso_pipeline('data.h5', 'class')
+    # Example usage with DataFrame iterator:
+    # from data_access import data_iterator
+    # df_iter = data_iterator(base_dir='/path/to/data', chunk_size=10000)
+    # df_final = run_bpso_pipeline(df_iter, target_col='class')
     pass

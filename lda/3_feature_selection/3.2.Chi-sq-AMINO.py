@@ -26,9 +26,17 @@ def h5_chunk_iterator(h5_path, dataset_name='data', chunk_size=10000):
 
 # --- PASS 1: STREAMING STATISTICS ---
 
-def compute_pass1_stats(h5_path, target_col, dataset_name='data', chunk_size=10000, q_bins=5):
+def compute_pass1_stats(df_iterator, target_col, q_bins=5):
     """
-    Computes Variance and Chi-Squared contingency tables in a single pass over the file.
+    Computes Variance and Chi-Squared contingency tables from a DataFrame iterator.
+    
+    Args:
+        df_iterator: Iterator yielding DataFrames
+        target_col: Name of the target column
+        q_bins: Number of bins for chi-squared discretization
+    
+    Returns:
+        tuple: (variance_series, chi_series)
     """
     print("Starting Pass 1: Computing Variance and Chi-Squared statistics...")
     
@@ -39,10 +47,13 @@ def compute_pass1_stats(h5_path, target_col, dataset_name='data', chunk_size=100
     
     # Chi-Squared (Contingency Tables) State
     global_chi_tables = {}
+    feature_cols = None
     
-    for chunk in h5_chunk_iterator(h5_path, dataset_name, chunk_size):
+    for chunk in df_iterator:
         # 1. Setup Columns
-        feature_cols = [c for c in chunk.columns if c not in METADATA_COLS and c != target_col]
+        if feature_cols is None:
+            feature_cols = [c for c in chunk.columns if c not in METADATA_COLS and c != target_col]
+        
         data_b = chunk[feature_cols].values
         y_b = chunk[target_col]
         n_b = data_b.shape[0]
@@ -99,17 +110,29 @@ def get_threshold_features(series, label="Statistic"):
 
 # --- MAIN WORKFLOW ---
 
-def run_feature_selection_pipeline(h5_path, target_col, dataset_name='data', max_amino=10):
+def run_feature_selection_pipeline(df_iterator, target_col='class', max_amino=10):
     """
     Complete Pipeline:
-    1. Pass 1 Variance/Chi2 scan.
+    1. Pass 1 Variance/Chi2 scan from DataFrame iterator.
     2. Knee Detection to filter noise.
-    3. Pass 2 Selective Load of top features.
+    3. Pass 2 Extract candidate features from collected data.
     4. AMINO redundancy reduction.
+    
+    Args:
+        df_iterator: Iterator yielding DataFrames with features and target column
+        target_col: Name of the target column (default: 'class')
+        max_amino: Maximum number of features to output from AMINO
+    
+    Returns:
+        pd.DataFrame: Final selected features + target column
     """
     
+    # Convert iterator to list for two-pass processing
+    print("Collecting data from iterator...")
+    df_chunks = list(df_iterator)
+    
     # 1. Pass 1: Gather global stats
-    var_s, chi_s = compute_pass1_stats(h5_path, target_col, dataset_name)
+    var_s, chi_s = compute_pass1_stats(iter(df_chunks), target_col)
     
     # 2. Thresholding
     high_var_features = get_threshold_features(var_s, "Variance")
@@ -119,17 +142,19 @@ def run_feature_selection_pipeline(h5_path, target_col, dataset_name='data', max
     candidate_features = list(set(high_var_features) & set(high_chi_features))
     print(f"Candidate features for AMINO: {len(candidate_features)}")
 
-    # 3. Pass 2: Load ONLY the survivors into RAM
-    print("Pass 2: Loading candidate features for AMINO...")
-    with h5py.File(h5_path, 'r') as f:
-        all_cols = list(f[dataset_name].attrs.get('column_names', []))
-        indices = [all_cols.index(c) for c in candidate_features]
-        target_idx = all_cols.index(target_col)
-        
-        # Load vertical slice
-        reduced_data = f[dataset_name][:, indices]
-        y_data = f[dataset_name][:, target_idx]
-        
+    # 3. Pass 2: Extract candidate features from collected chunks
+    print("Pass 2: Extracting candidate features for AMINO...")
+    
+    # Combine all chunks and select candidate features + target
+    combined_df = pd.concat(df_chunks, ignore_index=True)
+    
+    # Select only candidate features and target
+    cols_to_keep = candidate_features + [target_col]
+    df_amino_input = combined_df[cols_to_keep]
+    
+    reduced_data = df_amino_input[candidate_features].values
+    y_data = df_amino_input[target_col].values
+    
     df_amino_input = pd.DataFrame(reduced_data, columns=candidate_features)
     gc.collect()
 
@@ -147,7 +172,9 @@ def run_feature_selection_pipeline(h5_path, target_col, dataset_name='data', max
     return final_df
 
 if __name__ == "__main__":
-    # Example usage:
-    # result_df = run_feature_selection_pipeline('input_data.h5', target_col='class')
+    # Example usage with DataFrame iterator:
+    # from data_access import data_iterator
+    # df_iter = data_iterator(base_dir='/path/to/data', chunk_size=10000)
+    # result_df = run_feature_selection_pipeline(df_iter, target_col='class')
     # result_df.to_csv('final_features.csv', index=False)
     pass
