@@ -3,29 +3,63 @@ import numpy as np
 from sklearn.preprocessing import normalize
 
 def run_zhlda(
-    input_csv='mpso.csv',
-    output_csv='ZHLDA.csv',
-    nDataPoints=754,
-    num_class=3,
-    num_descriptor=7,
+    data,
     num_eigenvector=2,
-    descriptor_list=['res159.439', 'res245.369', 'res64.137', 'res199.471', 'res78.450', 'res242.340', 'res77.293'],
     learning_rate=0.0001,
     num_iteration=10000,
-    stop_crit=500
+    stop_crit=500,
+    target_col='class',
+    save_csv=False,
+    output_csv='ZHLDA.csv'
 ):
-    ### STEP 1. Load input data
-    df = pd.read_csv(input_csv)
-    ### STEP 2. Zero-mean the data
-    np.set_printoptions(precision=8)
-    for elem in descriptor_list:
-        print('Mean for ', elem, ': ', df[elem].mean())
-        df[elem] = df[elem] - df[elem].mean()
-
+    """
+    Perform Zero-mean Heteroscedastic Linear Discriminant Analysis on input data.
+    
+    Args:
+        data: DataFrame or iterator of DataFrames containing the input data
+        num_eigenvector: Number of eigenvectors to use
+        learning_rate: Learning rate for gradient descent
+        num_iteration: Maximum number of iterations
+        stop_crit: Stopping criterion for convergence
+        target_col: Name of the target column (default: 'class')
+        save_csv: If True, save results to CSV file (default: False)
+        output_csv: Output CSV filename (only used if save_csv=True)
+    
+    Yields:
+        DataFrame with ZHLDA-transformed features and class labels
+    """
+    # Handle iterator or single DataFrame
+    if hasattr(data, '__iter__') and not isinstance(data, pd.DataFrame):
+        # If it's an iterator, consume it into a single DataFrame
+        df = pd.concat(data, ignore_index=True)
+    else:
+        df = data.copy()
+    
+    # Validate target column exists
+    if target_col not in df.columns:
+        raise ValueError(f"Target column '{target_col}' not found in DataFrame. Available columns: {df.columns.tolist()}")
+    
+    # Infer parameters from data
+    descriptor_list = [col for col in df.columns if col != target_col]
+    num_descriptor = len(descriptor_list)
+    
+    if num_descriptor == 0:
+        raise ValueError("No feature columns found in DataFrame (all columns are target column)")
+    
+    # Infer class information
+    num_class = df[target_col].nunique()
+    class_counts = df[target_col].value_counts()
+    nDataPoints = class_counts.iloc[0]  # Assumes balanced classes
+    
+    print(f"Inferred parameters:")
+    print(f"  - Number of features: {num_descriptor}")
+    print(f"  - Number of classes: {num_class}")
+    print(f"  - Data points per class: {nDataPoints}")
+    print(f"  - Feature columns: {descriptor_list}")
     ### STEP 3. Separate data and generate labels
-    X = df.iloc[:,:num_descriptor].values
+    X = df[descriptor_list].values
     X = X.astype(np.float64)
-    y = np.concatenate([np.zeros(nDataPoints)+1,np.ones(nDataPoints)+1,np.ones(nDataPoints)+2])
+    y = df[target_col].values
     print(X)
     print(y)
 
@@ -168,14 +202,21 @@ def run_zhlda(
 
     ### STEP 9. Transform the samples onto the new subspace
     X_ldaz = X.dot(W.real) 
-    y = np.concatenate([np.zeros(nDataPoints),np.ones(nDataPoints),np.ones(nDataPoints)+1])
+    y_output = df[target_col].values
 
-    np.savetxt(output_csv, X_ldaz, delimiter=",", fmt="%.6f", header="LD1, LD2", comments="")
-    df2 = pd.read_csv(output_csv)
-    df2['class'] = y
-    df2.to_csv(output_csv, encoding='utf-8', index=False)
+    # Create result DataFrame
+    result_df = pd.DataFrame(X_ldaz, columns=['LD1', 'LD2'])
+    result_df[target_col] = y_output
     
-    return X_ldaz, W
+    if save_csv:
+        result_df.to_csv(output_csv, encoding='utf-8', index=False)
+    
+    yield result_df
 
 if __name__ == "__main__":
-    run_zhlda()
+    # Example usage:
+    # df = pd.read_csv('mpso.csv')
+    # result_iterator = run_zhlda(df, save_csv=True, output_csv='ZHLDA.csv')
+    # for result_df in result_iterator:
+    #     print(result_df.head())
+    pass

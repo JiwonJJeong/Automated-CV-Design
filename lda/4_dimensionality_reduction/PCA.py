@@ -3,25 +3,58 @@ import numpy as np
 from sklearn.decomposition import PCA
 
 def run_pca(
-    input_csv='mpso.csv',
-    output_csv='PCA.csv',
-    nDataPoints=754,
+    data,
     num_eigenvector=2,
-    descriptor_list=['res159.439', 'res245.369', 'res64.137', 'res199.471', 'res78.450', 'res242.340', 'res77.293']
+    target_col='class',
+    save_csv=False,
+    output_csv='PCA.csv'
 ):
-    ### STEP 1. Load input data
-    df = pd.read_csv(input_csv)
-
-    ### STEP 1. Zero-mean the data
-    np.set_printoptions(precision=8)
-    for elem in descriptor_list:
-        print('Mean for ', elem, ': ', df[elem].mean())
-        df[elem] = df[elem] - df[elem].mean()
+    """
+    Perform PCA dimensionality reduction on input data.
+    
+    Args:
+        data: DataFrame or iterator of DataFrames containing the input data
+        num_eigenvector: Number of principal components to extract
+        target_col: Name of the target column (default: 'class')
+        save_csv: If True, save results to CSV file (default: False)
+        output_csv: Output CSV filename (only used if save_csv=True)
+    
+    Yields:
+        DataFrame with PCA-transformed features and class labels
+    """
+    # Handle iterator or single DataFrame
+    if hasattr(data, '__iter__') and not isinstance(data, pd.DataFrame):
+        # If it's an iterator, consume it into a single DataFrame
+        df = pd.concat(data, ignore_index=True)
+    else:
+        df = data.copy()
+    
+    # Validate target column exists
+    if target_col not in df.columns:
+        raise ValueError(f"Target column '{target_col}' not found in DataFrame. Available columns: {df.columns.tolist()}")
+    
+    # Infer parameters from data
+    descriptor_list = [col for col in df.columns if col != target_col]
+    num_descriptor = len(descriptor_list)
+    
+    if num_descriptor == 0:
+        raise ValueError("No feature columns found in DataFrame (all columns are target column)")
+    
+    # Infer class information
+    num_class = df[target_col].nunique()
+    class_counts = df[target_col].value_counts()
+    nDataPoints = class_counts.iloc[0]  # Assumes balanced classes
+    
+    print(f"Inferred parameters:")
+    print(f"  - Number of features: {num_descriptor}")
+    print(f"  - Number of classes: {num_class}")
+    print(f"  - Data points per class: {nDataPoints}")
+    print(f"  - Feature columns: {descriptor_list}")
 
     ### STEP 2. Separate data and generate labels
-    X = df.iloc[:,:len(descriptor_list)].values
+    X = df[descriptor_list].values
     X = X.astype(np.float64)
-    y = np.concatenate([np.zeros(nDataPoints),np.ones(nDataPoints),np.ones(nDataPoints)+1])
+    y = df[target_col].values
     print(X)
 
     ### STEP 3. Perform PCA
@@ -32,14 +65,21 @@ def run_pca(
 
     pca_df = pd.DataFrame(data=pca_X, columns=['PC1', 'PC2'])
     pca_df['class'] = y
-    pca_df.to_csv(output_csv, index=False)
+    
+    if save_csv:
+        pca_df.to_csv(output_csv, index=False)
 
     ### STEP 4. Calculate variances (eigenvalues) and CVs (eigenvectors)
     print('Variances:', pca.explained_variance_)
     print('Variance ratios:', pca.explained_variance_ratio_)
     print('CVs:', pca.components_)
     
-    return pca_X, pca.components_
+    yield pca_df
 
 if __name__ == "__main__":
-    run_pca()
+    # Example usage:
+    # df = pd.read_csv('mpso.csv')  # Output from feature selection
+    # result_iterator = run_pca(df, save_csv=True, output_csv='PCA.csv')
+    # for result_df in result_iterator:
+    #     print(result_df.head())
+    pass
