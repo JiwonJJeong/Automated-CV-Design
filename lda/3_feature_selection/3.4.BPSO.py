@@ -1,8 +1,7 @@
 import numpy as np
 import pandas as pd
-import h5py
 import gc
-from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.model_selection import cross_val_score
 from sklearn.svm import LinearSVC
 from sklearn.multiclass import OneVsRestClassifier
 from sklearn.ensemble import BaggingClassifier
@@ -10,21 +9,22 @@ from niapy.problems import Problem
 from niapy.task import Task
 from niapy.algorithms.basic import ParticleSwarmOptimization
 
+# Standardized helpers
+from data_access import get_feature_cols, METADATA_COLS
+
 # --- PASS 1: STREAMING FISHER ---
 
-def compute_streaming_fisher(df_factory, target_col):
-    """Memory-efficient Fisher scores using a factory to stream data."""
+def compute_streaming_fisher(df_iterator, target_col):
+    """Memory-efficient Fisher scores using a data stream."""
     print("Pass 1: Filtering features via Streaming Fisher Score...")
     stats = {}
     feature_cols = None
     total_n = 0
 
-    # Ensure we use the factory to get a fresh generator
-    for chunk in df_factory():
+    for chunk in df_iterator:
         if feature_cols is None:
-            # Filter out metadata
-            feature_cols = [c for c in chunk.columns if c not in 
-                            {target_col, 'construct', 'subconstruct', 'replica', 'frame_number'}]
+            # Use same helper logic as Chi-Sq script
+            feature_cols = [c for c in get_feature_cols(chunk) if c != target_col]
         
         y = chunk[target_col].astype(int).values
         for label in np.unique(y):
@@ -40,7 +40,9 @@ def compute_streaming_fisher(df_factory, target_col):
         
         total_n += len(chunk)
 
-    # Global mean and scoring
+    if total_n == 0:
+        return pd.Series(dtype=float)
+
     global_sum = sum(s['sum'] for s in stats.values())
     global_mean = global_sum / total_n
     
@@ -49,9 +51,7 @@ def compute_streaming_fisher(df_factory, target_col):
     
     for label, s in stats.items():
         m_k = s['sum'] / s['n']
-        # SS_within = sum(x^2) - (sum(x)^2 / n)
         ss_within = s['sum_sq'] - (s['sum']**2 / s['n'])
-        
         num += s['n'] * (m_k - global_mean)**2
         den += ss_within
     
@@ -71,7 +71,6 @@ class SVMFeatureSelection(Problem):
         if selected.sum() == 0: 
             return 1.0
         
-        # Fast LinearSVC with limited samples for iteration speed
         clf = OneVsRestClassifier(BaggingClassifier(
             LinearSVC(dual=False, tol=1e-3), 
             n_jobs=-1, n_estimators=5, max_samples=0.8
@@ -86,23 +85,40 @@ class SVMFeatureSelection(Problem):
 
 # --- MAIN PIPELINE ---
 
-def run_bpso_pipeline(df_factory, target_col='class', candidate_limit=150, bpso_iters=30, seed=None):
+def run_bpso_pipeline(df_iterator_factory, target_col='class', candidate_limit=150, bpso_iters=30, seed=None):
     """
-    1. Pass 1: Streams factory to find top N Fisher candidates.
-    2. Pass 2: Streams factory to load ONLY top N candidates into RAM.
-    3. Run BPSO on the RAM-resident subset.
+    Integrated Pipeline accepting a callable factory to avoid generator exhaustion.
+    Optimized for memory efficiency and total metadata preservation.
     """
-    # 1. Narrow the search space (Filter)
-    fisher_scores = compute_streaming_fisher(df_factory, target_col)
+    # 1. Pass 1: Statistics (Fisher Filter)
+    # We call the factory to get a fresh iterator for Pass 1
+    fisher_scores = compute_streaming_fisher(df_iterator_factory(), target_col)
+    
+    if fisher_scores.empty:
+        print("Warning: No data found during Fisher Pass.")
+        return pd.DataFrame()
+
     candidates = fisher_scores.index[:candidate_limit].tolist()
     
     # 2. Pass 2: Selective RAM Load
     print(f"Pass 2: Loading top {len(candidates)} features into memory...")
-    data_list = []
-    cols_to_keep = candidates + [target_col]
     
-    for chunk in df_factory():
-        data_list.append(chunk[cols_to_keep])
+    # DYNAMIC METADATA IDENTIFICATION
+    # Peek at one chunk to see which metadata columns are actually present
+    try:
+        sample_chunk = next(df_iterator_factory())
+        existing_metadata = [c for c in METADATA_COLS if c in sample_chunk.columns]
+    except StopIteration:
+        return pd.DataFrame()
+
+    # Ensure target_col and all available metadata are preserved in the load list
+    cols_to_keep = candidates + [target_col] + existing_metadata
+    
+    data_list = []
+    # Call factory again for the second full pass
+    for chunk in df_iterator_factory():
+        available = [c for c in cols_to_keep if c in chunk.columns]
+        data_list.append(chunk[available])
     
     narrow_df = pd.concat(data_list, ignore_index=True)
     del data_list
@@ -116,7 +132,6 @@ def run_bpso_pipeline(df_factory, target_col='class', candidate_limit=150, bpso_
     problem = SVMFeatureSelection(X, y)
     task = Task(problem, max_iters=bpso_iters)
     
-    # FIX: Pass the seed directly to the PSO algorithm
     algorithm = ParticleSwarmOptimization(population_size=15, seed=seed)
     
     best_x, _ = algorithm.run(task)
@@ -125,7 +140,12 @@ def run_bpso_pipeline(df_factory, target_col='class', candidate_limit=150, bpso_
     
     print(f"Final selection: {len(final_features)} features.")
     
-    return narrow_df[final_features + [target_col]]
+    # 4. Final Assembly
+    # Grab everything that was in narrow_df but NOT in the candidates list
+    # This automatically includes target_col, replica, frame_number, etc.
+    other_cols = [c for c in narrow_df.columns if c not in candidates]
+    
+    return narrow_df[final_features + other_cols]
 
 if __name__ == "__main__":
     pass
