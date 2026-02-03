@@ -3,47 +3,117 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 import h5py
+from typing import Iterator, Dict, List, Optional, Union, Tuple
+
+# =============================================================================
+# CONFIGURATION AND CONSTANTS
+# =============================================================================
 
 # BASE_DIR should be set to the base_directory_of_analysis mentioned in NEW_README.md
 # It can be overriden by the DATA_BASE_DIR environment variable.
 DATA_BASE_DIR = "/work/hdd/bfri/jjeong7/analysis_output/dist_maps"
 BASE_DIR = os.environ.get("DATA_BASE_DIR", DATA_BASE_DIR)
 
-# Default residues based on the 150-residue canonical mapping in 2.1.NEW_README.md
-DEFAULT_RESIDUE_LIST = list(range(150))
+# Default residues based on the canonical mapping - will be loaded from data files
+DEFAULT_RESIDUE_LIST = list(range(144))  # Updated to 144 based on actual data
 
-def get_residue_feature_names(residue_list=DEFAULT_RESIDUE_LIST):
+# Standardized metadata columns that should be ignored by feature selection
+METADATA_COLS = {'construct', 'subconstruct', 'replica', 'frame_number', 'time'}
+
+# =============================================================================
+# FEATURE NAME GENERATION
+# =============================================================================
+
+def load_canonical_residues(data_dir: str = BASE_DIR) -> np.ndarray:
     """
-    Generates pairwise feature names from a list of residue IDs (slots).
-    Matches the condensed upper triangle order (i < j) used in the 150x150 distance matrix.
-    Total features: 150*(149)/2 = 11,175.
+    Loads canonical residue IDs from the canonical_resids.npy file.
     
     Args:
-        residue_list (list): Sorted list of canonical residue slots (0-149).
+        data_dir (str): Base directory containing the data files.
         
     Returns:
-        list: List of strings in 'RES<i>_<j>' format.
+        np.ndarray: Array of canonical residue IDs.
+        
+    Raises:
+        FileNotFoundError: If canonical_resids.npy file is not found.
     """
+    # Look for canonical_resids.npy in the subdirectories
+    base_path = Path(data_dir)
+    
+    # Search for canonical_resids.npy files
+    resids_files = list(base_path.glob("**/canonical_resids.npy"))
+    
+    if not resids_files:
+        raise FileNotFoundError(f"canonical_resids.npy not found in {data_dir} or its subdirectories")
+    
+    # Use the first one found (they should be identical across subconstructs)
+    canonical_resids = np.load(resids_files[0])
+    
+    print(f"Loaded {len(canonical_resids)} canonical residues from {resids_files[0]}")
+    return canonical_resids
+
+def get_feature_cols(df: pd.DataFrame) -> List[str]:
+    """
+    Returns only the RES_<i>_<j> columns from a DataFrame.
+    
+    Args:
+        df (pd.DataFrame): DataFrame containing feature and metadata columns.
+        
+    Returns:
+        List[str]: List of feature column names (excluding metadata).
+    """
+    return [c for c in df.columns if c not in METADATA_COLS]
+
+def get_residue_feature_names(residue_list: Optional[List[int]] = None, 
+                            data_dir: str = BASE_DIR) -> List[str]:
+    """
+    Generates pairwise feature names from a list of residue IDs (slots).
+    Matches the condensed upper triangle order (i < j) used in the distance matrix.
+    Total features: n*(n-1)/2 where n is the number of residues.
+    
+    Args:
+        residue_list (List[int], optional): List of canonical residue slots. 
+                                          If None, loads from canonical_resids.npy.
+        data_dir (str): Base directory containing the data files.
+        
+    Returns:
+        List[str]: List of strings in 'RES<i>_<j>' format with 1-based indexing.
+    """
+    if residue_list is None:
+        # Load canonical residues from data files
+        residue_list = load_canonical_residues(data_dir).tolist()
+    
     names = []
     n_res = len(residue_list)
     # The condensed upper triangle order in row-major corresponds to squareform
     for i in range(n_res):
         for j in range(i + 1, n_res):
+            # Use 1-based indexing to match PDB residue numbering
             names.append(f"RES{residue_list[i] + 1}_{residue_list[j] + 1}")
     return names
 
-def get_data_files(base_dir=BASE_DIR):
+# =============================================================================
+# DATA DISCOVERY AND FILE MANAGEMENT
+# =============================================================================
+
+def get_data_files(base_dir: str = BASE_DIR) -> List[Dict[str, str]]:
     """
-    Finds all pairwise_dist.h5 and pairwise_dist.npy files and extracts metadata.
-    Prefer .h5 if both exist for the same replica.
+    Discovers all pairwise_dist.h5 and pairwise_dist.npy files and extracts metadata.
+    Prefers .h5 if both exist for the same replica.
     
     Expected structure:
     base_dir/
     └── construct/
         └── subconstruct/
             └── {replica}_s{start}_e{end}_pairwise_dist.{h5|npy}
+    
+    Args:
+        base_dir (str): Base directory containing the data files.
+        
+    Returns:
+        List[Dict]: List of file information dictionaries sorted by construct, subconstruct, replica.
     """
-    data_files_dict = {} # key: (construct, subconstruct, replica_str)
+    data_files_dict = {}  # key: (construct, subconstruct, replica_str)
     base_path = Path(base_dir)
     
     # glob pattern to match .h5 and .npy files
@@ -75,7 +145,7 @@ def get_data_files(base_dir=BASE_DIR):
                     "construct": construct,
                     "subconstruct": subconstruct,
                     "replica": replica_str,
-                    "type": data_file.suffix[1:] # 'h5' or 'npy'
+                    "type": data_file.suffix[1:]  # 'h5' or 'npy'
                 }
         except ValueError:
             continue
@@ -85,126 +155,104 @@ def get_data_files(base_dir=BASE_DIR):
     data_files.sort(key=lambda x: (x["construct"], x["subconstruct"], x["replica"]))
     return data_files
 
-def convert_npy_to_h5(npy_path, h5_path, time_path=None, dataset_name='distances'):
+def get_h5_info(h5_path: str) -> Dict[str, Dict[str, Union[Tuple, str, float]]]:
+    """
+    Get basic info about .h5 file structure and dataset sizes.
+    
+    Args:
+        h5_path (str): Path to .h5 file.
+    
+    Returns:
+        dict: File information including datasets and their shapes.
+    """
+    info = {}
+    with h5py.File(h5_path, 'r') as f:
+        def visit_func(name, obj):
+            if isinstance(obj, h5py.Dataset):
+                info[name] = {
+                    'shape': obj.shape,
+                    'dtype': str(obj.dtype),
+                    'size_mb': obj.nbytes / (1024 ** 2)
+                }
+        
+        f.visititems(visit_func)
+    
+    return info
+
+# =============================================================================
+# DATA FORMAT CONVERSION
+# =============================================================================
+
+def convert_npy_to_h5(npy_path: str, h5_path: str, time_path: Optional[str] = None, 
+                     dataset_name: str = 'distances') -> None:
     """
     Converts a legacy .npy distance file to the new HDF5 format.
+    
+    Args:
+        npy_path (str): Path to input .npy file.
+        h5_path (str): Path to output .h5 file.
+        time_path (str, optional): Path to time.npy file. If None, looks for time.npy in same directory.
+        dataset_name (str): Name for the dataset in the H5 file.
     """
     print(f"Converting {npy_path} -> {h5_path}...")
     distances = np.load(npy_path)
     
     # Try to load companion time data
-    times = None
-    if time_path and os.path.exists(time_path):
-        times = np.load(time_path)
-    else:
-        # Check in the same directory for time.npy
-        potential_time_npy = os.path.join(os.path.dirname(npy_path), 'time.npy')
-        if os.path.exists(potential_time_npy):
-            times = np.load(potential_time_npy)
+    times = _load_time_data(npy_path, time_path)
     
     with h5py.File(h5_path, 'w') as f:
         f.create_dataset(dataset_name, data=distances, compression="gzip", chunks=True)
         if times is not None:
             # If time.npy is a master file, slice it to match distances
             if len(times) >= len(distances):
-                # Try to extract the range from filename if it's there
-                # e.g., 0_s0001_e0300_...
-                try:
-                    parts = os.path.basename(npy_path).split('_')
-                    if len(parts) > 2 and parts[1].startswith('s') and parts[2].startswith('e'):
-                        start_idx = int(parts[1][1:]) - 1
-                        end_idx = int(parts[2][1:])
-                        f.create_dataset('times', data=times[start_idx:end_idx], compression="gzip")
-                    else:
-                        f.create_dataset('times', data=times[:len(distances)], compression="gzip")
-                except:
-                    f.create_dataset('times', data=times[:len(distances)], compression="gzip")
+                sliced_times = _slice_times_from_filename(npy_path, times, len(distances))
+                f.create_dataset('times', data=sliced_times, compression="gzip")
             else:
                 f.create_dataset('times', data=times, compression="gzip")
     print("Conversion complete.")
 
-def data_iterator(base_dir=BASE_DIR, chunk_size=10000, dataset_name='distances'):
-    """
-    Iterative data provider that yields DataFrames from H5 or NPY files.
-    """
-    data_files = get_data_files(base_dir)
+def _load_time_data(npy_path: str, time_path: Optional[str] = None) -> Optional[np.ndarray]:
+    """Helper function to load time data from various sources."""
+    if time_path and os.path.exists(time_path):
+        return np.load(time_path)
     
-    if not data_files:
-        print(f"No data files found in {base_dir}")
-        return
+    # Check in the same directory for time.npy
+    potential_time_npy = os.path.join(os.path.dirname(npy_path), 'time.npy')
+    if os.path.exists(potential_time_npy):
+        return np.load(potential_time_npy)
+    
+    return None
 
-    for file_info in data_files:
-        try:
-            if file_info["type"] == 'h5':
-                with h5py.File(file_info["path"], 'r') as f:
-                    if dataset_name not in f:
-                        # Fallback to 'data' if 'distances' isn't there
-                        actual_ds = 'data' if 'data' in f else None
-                        if not actual_ds:
-                            print(f"Warning: No valid dataset found in {file_info['path']}")
-                            continue
-                    else:
-                        actual_ds = dataset_name
-                    
-                    dataset = f[actual_ds]
-                    total_rows = dataset.shape[0]
-                    times = f['times'][:] if 'times' in f else None
-                    column_names = dataset.attrs.get('column_names', [f'feature_{i}' for i in range(dataset.shape[1])])
-                    
-                    for start_idx in range(0, total_rows, chunk_size):
-                        end_idx = min(start_idx + chunk_size, total_rows)
-                        chunk_data = dataset[start_idx:end_idx]
-                        df = pd.DataFrame(chunk_data, columns=column_names)
-                        
-                        df['construct'] = file_info['construct']
-                        df['subconstruct'] = file_info['subconstruct']
-                        df['replica'] = file_info['replica']
-                        if times is not None:
-                            df['time'] = times[start_idx:end_idx]
-                        df['frame_number'] = np.arange(start_idx, end_idx) + 1
-                        yield df
-            
-            elif file_info["type"] == 'npy':
-                # Map-read the npy for memory efficiency
-                data = np.load(file_info["path"], mmap_mode='r')
-                total_rows = data.shape[0]
-                column_names = [f'feature_{i}' for i in range(data.shape[1])]
-                
-                # Mock times if time.npy exists
-                times = None
-                potential_time_npy = os.path.join(os.path.dirname(file_info["path"]), 'time.npy')
-                if os.path.exists(potential_time_npy):
-                    full_times = np.load(potential_time_npy)
-                    # Try to slice based on filename
-                    try:
-                        pts = os.path.basename(file_info["path"]).split('_')
-                        s = int(pts[1][1:]) - 1
-                        e = int(pts[2][1:])
-                        times = full_times[s:e]
-                    except:
-                        times = full_times[:total_rows]
+def _slice_times_from_filename(npy_path: str, times: np.ndarray, target_length: int) -> np.ndarray:
+    """Helper function to slice times based on filename patterns."""
+    try:
+        parts = os.path.basename(npy_path).split('_')
+        if len(parts) > 2 and parts[1].startswith('s') and parts[2].startswith('e'):
+            start_idx = int(parts[1][1:]) - 1
+            end_idx = int(parts[2][1:])
+            return times[start_idx:end_idx]
+        else:
+            return times[:target_length]
+    except:
+        return times[:target_length]
 
-                for start_idx in range(0, total_rows, chunk_size):
-                    end_idx = min(start_idx + chunk_size, total_rows)
-                    chunk_data = data[start_idx:end_idx]
-                    df = pd.DataFrame(chunk_data, columns=column_names)
-                    
-                    df['construct'] = file_info['construct']
-                    df['subconstruct'] = file_info['subconstruct']
-                    df['replica'] = file_info['replica']
-                    if times is not None:
-                        df['time'] = times[start_idx:end_idx]
-                    df['frame_number'] = np.arange(start_idx, end_idx) + 1
-                    yield df
-                    
-        except Exception as e:
-            print(f"Error processing {file_info['path']}: {e}")
-            continue
+# =============================================================================
+# H5 FILE OPERATIONS
+# =============================================================================
 
-def load_h5_data(h5_path, dataset_name='distances', chunk_size=None):
+def load_h5_data(h5_path: str, dataset_name: str = 'distances', 
+                chunk_size: Optional[int] = None) -> Union[pd.DataFrame, Iterator[pd.DataFrame]]:
     """
     Load data from HDF5 file with optional chunking.
     Supports both pandas.to_hdf and raw h5py datasets.
+    
+    Args:
+        h5_path (str): Path to H5 file.
+        dataset_name (str): Name of dataset to load.
+        chunk_size (int, optional): If provided, returns iterator with chunks of this size.
+        
+    Returns:
+        pd.DataFrame or Iterator[pd.DataFrame]: Data as DataFrame or iterator of DataFrames.
     """
     if chunk_size is not None:
         return load_h5_data_iterator(h5_path, dataset_name, chunk_size)
@@ -215,18 +263,31 @@ def load_h5_data(h5_path, dataset_name='distances', chunk_size=None):
     except:
         # Fallback to raw h5py
         with h5py.File(h5_path, 'r') as f:
-            if dataset_name in f:
-                data = f[dataset_name][:]
-                return pd.DataFrame(data)
-            elif 'data' in f:
-                data = f['data'][:]
-                return pd.DataFrame(data)
+            if dataset_name not in f:
+                # Fallback to 'data' if 'distances' isn't there
+                actual_ds = 'data' if 'data' in f else None
+                if not actual_ds:
+                    print(f"Warning: No valid dataset found in {h5_path}")
+                    return None
             else:
-                raise KeyError(f"Dataset {dataset_name} not found in {h5_path}")
+                actual_ds = dataset_name
+            
+            dataset = f[actual_ds]
+            data = dataset[:]
+            return pd.DataFrame(data)
 
-def load_h5_data_iterator(h5_path, dataset_name='distances', chunk_size=10000):
+def load_h5_data_iterator(h5_path: str, dataset_name: str = 'distances', 
+                         chunk_size: int = 10000) -> Iterator[pd.DataFrame]:
     """
     Generator that yields chunks of data from an HDF5 file.
+    
+    Args:
+        h5_path (str): Path to H5 file.
+        dataset_name (str): Name of dataset to load.
+        chunk_size (int): Size of each chunk.
+        
+    Yields:
+        pd.DataFrame: Chunk of data.
     """
     # Check if it's a pandas store or raw h5py
     try:
@@ -250,8 +311,9 @@ def load_h5_data_iterator(h5_path, dataset_name='distances', chunk_size=10000):
                 end = min(start + chunk_size, ds.shape[0])
                 yield pd.DataFrame(ds[start:end])
 
-
-def save_h5_data(data, h5_path, dataset_name='distances', mode='w', format='table', times=None):
+def save_h5_data(data: Union[pd.DataFrame, np.ndarray], h5_path: str, 
+                dataset_name: str = 'distances', mode: str = 'w', 
+                format: str = 'table', times: Optional[np.ndarray] = None) -> None:
     """
     Save data to HDF5 file.
     
@@ -276,37 +338,195 @@ def save_h5_data(data, h5_path, dataset_name='distances', mode='w', format='tabl
             
     print(f"Saved {data.shape} to {h5_path}[{dataset_name}]")
 
+# =============================================================================
+# UNIFIED DATA ITERATORS (H5 + NPY)
+# =============================================================================
 
-def get_h5_info(h5_path):
+def data_iterator(base_dir: str = BASE_DIR, chunk_size: int = 10000, 
+                 dataset_name: str = 'distances') -> Iterator[pd.DataFrame]:
     """
-    Get basic info about .h5 file structure and dataset sizes.
+    Unified data iterator that yields DataFrames from both H5 and NPY files.
+    Automatically handles the mixed file structure and provides consistent output format.
     
     Args:
-        h5_path (str): Path to .h5 file.
-    
-    Returns:
-        dict: File information including datasets and their shapes.
-    """
-    info = {}
-    with h5py.File(h5_path, 'r') as f:
-        def visit_func(name, obj):
-            if isinstance(obj, h5py.Dataset):
-                info[name] = {
-                    'shape': obj.shape,
-                    'dtype': str(obj.dtype),
-                    'size_mb': obj.nbytes / (1024 ** 2)
-                }
+        base_dir (str): Base directory containing the data files.
+        chunk_size (int): Size of each chunk to yield.
+        dataset_name (str): Name of dataset to load from H5 files.
         
-        f.visititems(visit_func)
+    Yields:
+        pd.DataFrame: Data chunk with consistent column structure.
+    """
+    data_files = get_data_files(base_dir)
     
-    return info
+    if not data_files:
+        print(f"No data files found in {base_dir}")
+        return
 
+    for file_info in data_files:
+        try:
+            if file_info["type"] == 'h5':
+                yield from _iterate_h5_file(file_info, chunk_size, dataset_name)
+            elif file_info["type"] == 'npy':
+                yield from _iterate_npy_file(file_info, chunk_size)
+                    
+        except Exception as e:
+            print(f"Error processing {file_info['path']}: {e}")
+            continue
+
+def _iterate_h5_file(file_info: Dict[str, str], chunk_size: int, dataset_name: str) -> Iterator[pd.DataFrame]:
+    """Helper function to iterate over H5 files."""
+    with h5py.File(file_info["path"], 'r') as f:
+        # Determine the actual dataset name
+        actual_ds = _get_dataset_name(f, dataset_name)
+        if actual_ds is None:
+            print(f"Warning: No valid dataset found in {file_info['path']}")
+            return
+        
+        dataset = f[actual_ds]
+        total_rows = dataset.shape[0]
+        times = f['times'][:] if 'times' in f else None
+        
+        # Get column names from dataset attributes or generate from canonical residues
+        column_names = dataset.attrs.get('column_names')
+        if column_names is None:
+            # Generate feature names from canonical residues
+            try:
+                canonical_resids = load_canonical_residues(os.path.dirname(file_info["path"]))
+                column_names = get_residue_feature_names(canonical_resids.tolist())
+            except FileNotFoundError:
+                # Fallback to generic feature names
+                column_names = [f'feature_{i}' for i in range(dataset.shape[1])]
+        
+        for start_idx in range(0, total_rows, chunk_size):
+            end_idx = min(start_idx + chunk_size, total_rows)
+            chunk_data = dataset[start_idx:end_idx]
+            df = pd.DataFrame(chunk_data, columns=column_names)
+            
+            # Add metadata columns
+            df = _add_metadata_columns(df, file_info, start_idx, end_idx, times)
+            yield df
+
+def _iterate_npy_file(file_info: Dict[str, str], chunk_size: int) -> Iterator[pd.DataFrame]:
+    """Helper function to iterate over NPY files."""
+    # Map-read the npy for memory efficiency
+    data = np.load(file_info["path"], mmap_mode='r')
+    total_rows = data.shape[0]
+    
+    # Get column names from canonical residues or generate generic ones
+    try:
+        canonical_resids = load_canonical_residues(os.path.dirname(file_info["path"]))
+        column_names = get_residue_feature_names(canonical_resids.tolist())
+    except FileNotFoundError:
+        # Fallback to generic feature names
+        column_names = [f'feature_{i}' for i in range(data.shape[1])]
+    
+    # Load time data if available
+    times = _load_time_data_for_npy(file_info["path"], total_rows)
+
+    for start_idx in range(0, total_rows, chunk_size):
+        end_idx = min(start_idx + chunk_size, total_rows)
+        chunk_data = data[start_idx:end_idx]
+        df = pd.DataFrame(chunk_data, columns=column_names)
+        
+        # Add metadata columns
+        df = _add_metadata_columns(df, file_info, start_idx, end_idx, times)
+        yield df
+
+def _get_dataset_name(h5_file: h5py.File, dataset_name: str) -> Optional[str]:
+    """Helper function to determine the actual dataset name in H5 file."""
+    if dataset_name in h5_file:
+        return dataset_name
+    elif 'data' in h5_file:
+        return 'data'
+    else:
+        return None
+
+def _load_time_data_for_npy(npy_path: str, total_rows: int) -> Optional[np.ndarray]:
+    """Helper function to load and slice time data for NPY files."""
+    potential_time_npy = os.path.join(os.path.dirname(npy_path), 'time.npy')
+    if not os.path.exists(potential_time_npy):
+        return None
+    
+    full_times = np.load(potential_time_npy)
+    
+    # Try to slice based on filename
+    try:
+        pts = os.path.basename(npy_path).split('_')
+        if len(pts) > 2 and pts[1].startswith('s') and pts[2].startswith('e'):
+            start_idx = int(pts[1][1:]) - 1
+            end_idx = int(pts[2][1:])
+            return full_times[start_idx:end_idx]
+        else:
+            return full_times[:total_rows]
+    except:
+        return full_times[:total_rows]
+
+def _add_metadata_columns(df: pd.DataFrame, file_info: Dict[str, str], 
+                         start_idx: int, end_idx: int, 
+                         times: Optional[np.ndarray]) -> pd.DataFrame:
+    """Helper function to add metadata columns to DataFrame."""
+    df['construct'] = file_info['construct']
+    df['subconstruct'] = file_info['subconstruct']
+    df['replica'] = file_info['replica']
+    
+    if times is not None:
+        df['time'] = times[start_idx:end_idx]
+    
+    df['frame_number'] = np.arange(start_idx, end_idx) + 1
+    return df
+
+# =============================================================================
+# LEGACY COMPATIBILITY FUNCTIONS
+# =============================================================================
+
+def create_dataframe_factory(base_dir: str = BASE_DIR, **kwargs):
+    """
+    Creates a DataFrame factory compatible with existing pipeline functions.
+    Returns a callable that creates a fresh iterator every time it's called.
+    
+    This fixes the "Exhausted Generator" trap where generators can only be iterated once.
+    Pipelines need a callable (function that returns a generator) rather than the generator itself.
+    
+    Args:
+        base_dir (str): Base directory containing the data files.
+        **kwargs: Additional arguments passed to data_iterator.
+        
+    Returns:
+        callable: Function that returns a fresh data_iterator when called.
+    """
+    def factory():
+        return data_iterator(base_dir=base_dir, **kwargs)
+    
+    return factory
+
+# =============================================================================
+# MAIN EXECUTION AND TESTING
+# =============================================================================
 
 if __name__ == "__main__":
     # Quick test/validation script
     print(f"Searching in: {BASE_DIR}")
     files = get_data_files()
     print(f"Found {len(files)} data files.")
+    
+    # Test residue loading
+    try:
+        canonical_resids = load_canonical_residues()
+        print(f"Loaded {len(canonical_resids)} canonical residues")
+        print(f"Residue range: {canonical_resids[0]} to {canonical_resids[-1]}")
+        
+        # Test feature name generation with 1-based indexing
+        feature_names = get_residue_feature_names()
+        print(f"Generated {len(feature_names)} feature names")
+        print(f"First 5 features: {feature_names[:5]}")
+        print(f"Expected features: {len(canonical_resids) * (len(canonical_resids) - 1) // 2}")
+        
+        # Test metadata filtering
+        print(f"Metadata columns: {sorted(METADATA_COLS)}")
+        
+    except FileNotFoundError as e:
+        print(f"Warning: {e}")
+        print("Using fallback feature names.")
     
     if files:
         print("\nFirst 5 files found:")
@@ -316,6 +536,27 @@ if __name__ == "__main__":
         print("\nTesting iterator (first chunk):")
         for i, chunk in enumerate(data_iterator(chunk_size=10)):
             print(f"Chunk 0 shape: {chunk.shape}")
-            print("Columns:", chunk.columns.tolist()[-5:])
-            print("First row Sample:\n", chunk.iloc[0][-5:])
+            print("Columns:", chunk.columns.tolist()[:5], "...", chunk.columns.tolist()[-5:])
+            
+            # Test feature column extraction
+            feature_cols = get_feature_cols(chunk)
+            print(f"Feature columns: {len(feature_cols)}")
+            print(f"First 3 feature cols: {feature_cols[:3]}")
+            
+            print("First row Sample:\n", chunk.iloc[0][:5])
             break
+        
+        # Test the factory function (exhausted generator fix)
+        print("\nTesting DataFrame factory:")
+        factory = create_dataframe_factory(chunk_size=5)
+        
+        # First call
+        print("First factory call:")
+        chunk1 = next(factory())
+        print(f"  Shape: {chunk1.shape}")
+        
+        # Second call (should work without exhaustion)
+        print("Second factory call:")
+        chunk2 = next(factory())
+        print(f"  Shape: {chunk2.shape}")
+        print("✓ Factory successfully creates fresh iterators!")

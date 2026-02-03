@@ -1,180 +1,157 @@
 import numpy as np
 import pandas as pd
-import h5py
 import gc
-import matplotlib.pyplot as plt
 from kneed import KneeLocator
-from sklearn.feature_selection import chi2
 import amino_fast_mod as amino
 
-# --- CONFIGURATION ---
-METADATA_COLS = {'construct', 'subconstruct', 'replica', 'frame_number'}
+# Import your new refactored helper
+from data_access import create_dataframe_factory, get_feature_cols, METADATA_COLS
 
-def h5_chunk_iterator(h5_path, dataset_name='data', chunk_size=10000):
-    """Generates DataFrame chunks from an H5 file using memory-efficient slicing."""
-    with h5py.File(h5_path, 'r') as f:
-        dataset = f[dataset_name]
-        total_rows = dataset.shape[0]
-        # Attempt to get column names from attributes, else generic names
-        column_names = f[dataset_name].attrs.get('column_names')
-        if column_names is None:
-            column_names = [f'feature_{i}' for i in range(dataset.shape[1])]
-        
-        for i in range(0, total_rows, chunk_size):
-            end = min(i + chunk_size, total_rows)
-            yield pd.DataFrame(dataset[i:end], columns=column_names)
+# =============================================================================
+# CORE PROCESSING (SEQUENTIAL & OPTIMIZED)
+# =============================================================================
 
-# --- PASS 1: STREAMING STATISTICS ---
-
-def compute_pass1_stats(df_iterator, target_col, q_bins=5):
+def estimate_bin_edges(df_iterator, target_col, q_bins=5, sample_rows=20000):
     """
-    Computes Variance and Chi-Squared contingency tables from a DataFrame iterator.
-    
-    Args:
-        df_iterator: Iterator yielding DataFrames
-        target_col: Name of the target column
-        q_bins: Number of bins for chi-squared discretization
-    
-    Returns:
-        tuple: (variance_series, chi_series)
+    Pass 0: Reads a sample to estimate global quantile-based bin edges.
     """
-    print("Starting Pass 1: Computing Variance and Chi-Squared statistics...")
-    
-    # Variance (Chan's Algorithm) State
-    n_a = 0
-    mean_a = None
-    m2_a = None
-    
-    # Chi-Squared (Contingency Tables) State
-    global_chi_tables = {}
-    feature_cols = None
+    print(f"Sampling to estimate Chi-Squared bin edges...")
+    collected = 0
+    sample_list = []
     
     for chunk in df_iterator:
-        # 1. Setup Columns
-        if feature_cols is None:
-            feature_cols = [c for c in chunk.columns if c not in METADATA_COLS and c != target_col]
+        # Dynamically identify feature columns using the helper
+        feature_cols = [c for c in get_feature_cols(chunk) if c != target_col]
+        needed = sample_rows - collected
+        if needed <= 0: break
         
-        data_b = chunk[feature_cols].values
-        y_b = chunk[target_col]
-        n_b = data_b.shape[0]
+        sample_list.append(chunk[feature_cols].iloc[:needed])
+        collected += len(sample_list[-1])
+
+    if not sample_list: return {}
+
+    full_sample = pd.concat(sample_list)
+    X = full_sample.values
+    quantiles = np.linspace(0, 1, q_bins + 1)
+    
+    print(f"Computing quantiles for {X.shape[1]} features...")
+    all_edges = np.quantile(X, quantiles, axis=0)
+    
+    bin_edges = {col: np.unique(all_edges[:, i]) for i, col in enumerate(full_sample.columns)}
+    return bin_edges
+
+def compute_sequential_chi(df_iterator, target_col, bin_edges):
+    """
+    Pass 1: Sequentially builds contingency tables to calculate Chi-Squared scores.
+    Matches sklearn.feature_selection.chi2 behavior.
+    """
+    print("Building Chi-Squared scores sequentially...")
+    
+    global_counts = {} # {feature: 2D_array[bins, classes]}
+    classes = None
+    num_classes = 0
+
+    for chunk in df_iterator:
+        feature_cols = [c for c in get_feature_cols(chunk) if c != target_col]
         
-        # --- Update Variance (Online) ---
-        mean_b = np.mean(data_b, axis=0)
-        m2_b = np.var(data_b, axis=0, ddof=0) * n_b
+        # Initialize categories on the first chunk
+        if classes is None:
+            y_categories = pd.Categorical(chunk[target_col])
+            classes = y_categories.categories
+            num_classes = len(classes)
+            
+        y_codes = pd.Categorical(chunk[target_col], categories=classes).codes
         
-        if n_a == 0:
-            n_a, mean_a, m2_a = n_b, mean_b, m2_b
-        else:
-            n_ab = n_a + n_b
-            delta = mean_b - mean_a
-            mean_a = mean_a + delta * (n_b / n_ab)
-            m2_a = m2_a + m2_b + (delta ** 2) * (n_a * n_b / n_ab)
-            n_a = n_ab
-        
-        # --- Update Chi-Squared Counts ---
         for col in feature_cols:
-            # Rank-based discretization per chunk
-            binned = pd.qcut(chunk[col].rank(method='first'), q=q_bins, labels=False)
-            ct = pd.crosstab(binned, y_b)
-            if col not in global_chi_tables:
-                global_chi_tables[col] = ct
-            else:
-                global_chi_tables[col] = global_chi_tables[col].add(ct, fill_value=0)
+            edges = bin_edges[col]
+            # Digitize: map continuous distance to discrete bin index
+            binned = np.digitize(chunk[col].values, edges[1:-1], right=True)
+            num_bins = len(edges) - 1
+            
+            if col not in global_counts:
+                global_counts[col] = np.zeros((num_bins, num_classes))
+            
+            # Vectorized contingency update
+            for cls_idx in range(num_classes):
+                mask = (y_codes == cls_idx)
+                if np.any(mask):
+                    bin_counts = np.bincount(binned[mask], minlength=num_bins)
+                    global_counts[col][:, cls_idx] += bin_counts
 
-    # Finalize Variance
-    variance_series = pd.Series(m2_a / n_a, index=feature_cols)
-    
-    # Finalize Chi-Squared Scores
+    # Calculate Chi-Square from contingency tables
     chi_scores = {}
-    for col, ct in global_chi_tables.items():
-        observed = ct.values
-        row_sums, col_sums = observed.sum(axis=1, keepdims=True), observed.sum(axis=0, keepdims=True)
-        expected = (row_sums @ col_sums) / observed.sum()
-        expected[expected == 0] = 1e-9
-        chi_scores[col] = np.sum((observed - expected)**2 / expected)
-    
-    chi_series = pd.Series(chi_scores).sort_values(ascending=False)
-    
-    return variance_series, chi_series
+    for col, table in global_counts.items():
+        row_sums = table.sum(axis=1, keepdims=True)
+        col_sums = table.sum(axis=0, keepdims=True)
+        total = table.sum()
+        
+        expected = (row_sums @ col_sums) / total
+        mask = expected > 0
+        score = np.sum((table[mask] - expected[mask])**2 / expected[mask])
+        chi_scores[col] = score
+        
+    return pd.Series(chi_scores).sort_values(ascending=False)
 
-# --- UTILITIES ---
-
-def get_threshold_features(series, label="Statistic"):
-    """Finds the knee point and returns features above that threshold."""
-    y = sorted(series.values, reverse=True)
-    kn = KneeLocator(range(len(y)), y, curve='convex', direction='decreasing')
-    threshold = y[kn.knee] if kn.knee else 0.0
-    selected = series[series >= threshold].index.tolist()
-    print(f"{label} Knee: {threshold:.4f} | Kept {len(selected)} features.")
-    return selected
-
-# --- MAIN WORKFLOW ---
-
-def run_feature_selection_pipeline(df_iterator, target_col='class', max_amino=10):
+def extract_candidates_only(df_iterator, target_col, candidates):
     """
-    Complete Pipeline:
-    1. Pass 1 Variance/Chi2 scan from DataFrame iterator.
-    2. Knee Detection to filter noise.
-    3. Pass 2 Extract candidate features from collected data.
-    4. AMINO redundancy reduction.
-    
-    Args:
-        df_iterator: Iterator yielding DataFrames with features and target column
-        target_col: Name of the target column (default: 'class')
-        max_amino: Maximum number of features to output from AMINO
-    
-    Returns:
-        pd.DataFrame: Final selected features + target column
+    Pass 2: Extracts only high-signal features and essential metadata for AMINO.
     """
+    print(f"Loading {len(candidates)} candidate features into memory for AMINO...")
+    data_list = []
+    # Keep target_col and time/frame for tracking if needed
+    cols_to_keep = candidates + [target_col] + [c for c in ['time', 'frame_number'] if c in METADATA_COLS]
     
-    # Convert iterator to list for two-pass processing
-    print("Collecting data from iterator...")
-    df_chunks = list(df_iterator)
-    
-    # 1. Pass 1: Gather global stats
-    var_s, chi_s = compute_pass1_stats(iter(df_chunks), target_col)
-    
-    # 2. Thresholding
-    high_var_features = get_threshold_features(var_s, "Variance")
-    high_chi_features = get_threshold_features(chi_s, "Chi-Squared")
-    
-    # Intersect criteria (Must have variance AND predictive power)
-    candidate_features = list(set(high_var_features) & set(high_chi_features))
-    print(f"Candidate features for AMINO: {len(candidate_features)}")
+    for chunk in df_iterator:
+        # Only grab existing columns (safety)
+        available = [c for c in cols_to_keep if c in chunk.columns]
+        data_list.append(chunk[available])
+        
+    return pd.concat(data_list, ignore_index=True)
 
-    # 3. Pass 2: Extract candidate features from collected chunks
-    print("Pass 2: Extracting candidate features for AMINO...")
+# =============================================================================
+# MAIN WORKFLOW
+# =============================================================================
+
+def run_feature_selection_pipeline(df_iterator_factory, target_col='class', max_amino=10):
+    """
+    Integrated Pipeline accepting a callable factory to avoid generator exhaustion.
+    """
+    # Pass 0: Quantiles
+    bin_edges = estimate_bin_edges(df_iterator_factory(), target_col)
     
-    # Combine all chunks and select candidate features + target
-    combined_df = pd.concat(df_chunks, ignore_index=True)
+    # Pass 1: Statistics
+    chi_s = compute_sequential_chi(df_iterator_factory(), target_col, bin_edges)
     
-    # Select only candidate features and target
-    cols_to_keep = candidate_features + [target_col]
-    df_amino_input = combined_df[cols_to_keep]
+    # Knee Detection
+    y_vals = sorted(chi_s.values, reverse=True)
+    kn = KneeLocator(range(1, len(y_vals) + 1), y_vals, curve='convex', direction='decreasing', S=5.0)
+    threshold = kn.knee_y if kn.knee_y is not None else 0.0
+    candidate_features = chi_s[chi_s >= threshold].index.tolist()
     
-    reduced_data = df_amino_input[candidate_features].values
-    y_data = df_amino_input[target_col].values
+    print(f"Knee Point: {threshold:.4f} | Candidates: {len(candidate_features)}")
+
+    # Stability Cap for AMINO
+    if len(candidate_features) > 250:
+        candidate_features = chi_s.head(250).index.tolist()
     
-    df_amino_input = pd.DataFrame(reduced_data, columns=candidate_features)
+    # Pass 2: Load Candidates
+    df_amino_input = extract_candidates_only(df_iterator_factory(), target_col, candidate_features)
     gc.collect()
 
-    # 4. AMINO Optimization
-    print(f"Running AMINO (Max outputs: {max_amino})...")
+    # Pass 3: Redundancy reduction (AMINO)
+    print(f"Running AMINO...")
     ops = [amino.OrderParameter(name, df_amino_input[name].tolist()) for name in candidate_features]
-    final_ops = amino.find_ops(ops, max_outputs=max_amino, bins=30, distortion_filename=None)
-    final_feature_names = [str(op) for op in final_ops]
-
-    # 5. Final Result
-    final_df = df_amino_input[final_feature_names].copy()
-    final_df[target_col] = y_data
+    final_ops = amino.find_ops(ops, max_outputs=max_amino, bins=20, distortion_filename=None)
     
-    print(f"Pipeline Complete. Final Shape: {final_df.shape}")
-    return final_df
+    if not final_ops:
+        return df_amino_input[[target_col]].copy()
+
+    final_names = [str(op) for op in final_ops]
+    # Return the selected features + class + metadata for downstream analysis
+    return df_amino_input[final_names + [target_col]]
 
 if __name__ == "__main__":
-    # Example usage with DataFrame iterator:
-    # from data_access import data_iterator
-    # df_iter = data_iterator(base_dir='/path/to/data', chunk_size=10000)
-    # result_df = run_feature_selection_pipeline(df_iter, target_col='class')
-    # result_df.to_csv('final_features.csv', index=False)
+    # Example usage:
+    # factory = create_dataframe_factory(base_dir="/path/to/data", chunk_size=5000)
+    # selected_df = run_feature_selection_pipeline(factory, target_col='construct')
     pass
