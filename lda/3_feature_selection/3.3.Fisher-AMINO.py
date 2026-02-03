@@ -1,155 +1,150 @@
-import amino_fast_mod as amino
 import numpy as np
 import pandas as pd
+import h5py
 import gc
-import kneed
-import fisher_score_mod as fsm
-from kneed import KneeLocator
-import argparse
-import os
-from collections.abc import Iterable
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.svm import LinearSVC
+from sklearn.multiclass import OneVsRestClassifier
+from sklearn.ensemble import BaggingClassifier
+from niapy.problems import Problem
+from niapy.task import Task
+from niapy.algorithms.basic import ParticleSwarmOptimization
 
-def calculate_fisher_scores(df, target_col='class'):
-    """
-    Calculates Fisher scores and indices using fisher_score_mod.
-    """
-    print("Calculating Fisher scores...")
-    X = df.drop(target_col, axis=1)
-    y = df[target_col].to_numpy()
-    
-    # Calculate Fisher scores
-    score = fsm.fisher_score(X.to_numpy(), y, mode='score')
-    # Removed CSV saving of scores
-    
-    # Calculate Fisher indices
-    idx = fsm.fisher_score(X.to_numpy(), y, mode='index')
-    # Removed CSV saving of indices
-    
-    return score, idx
+# Import refactored helpers
+from data_access import get_feature_cols, METADATA_COLS
 
-def find_optimal_n_feat(scores, S=5, curve='convex', direction='decreasing'):
-    """
-    Uses KneeLocator to find the elbow point in sorted Fisher scores.
-    """
-    print("Finding optimal number of features using Kneedle algorithm...")
-    df_scores = pd.DataFrame(scores, columns=['fs'])
-    df_scores['ind'] = range(len(df_scores))
-    
-    # Sort scores in descending order
-    df_scores_sorted = df_scores.sort_values(by='fs', ascending=False).reset_index(drop=True)
-    # Removed CSV saving of sorted scores
-    
-    x = list(range(len(df_scores_sorted)))
-    y = df_scores_sorted['fs']
-    
-    kneedle = KneeLocator(x, y, S=S, curve=curve, direction=direction)
-    knee_point = kneedle.knee
-    
-    print(f"The knee point is at nFeat = {knee_point}, with a Fisher score of: {kneedle.knee_y}")
-    return knee_point, df_scores_sorted
+# --- PASS 1: STREAMING FISHER ---
 
-def prepare_amino_input(df_selected):
-    """
-    Converts DataFrame columns to amino.OrderParameter objects.
-    """
-    print(f"Preparing {len(df_selected.columns)} features for AMINO...")
-    gc.collect()
-    all_ops = []
-    for col in df_selected.columns:
-        all_ops.append(amino.OrderParameter(col, df_selected[col].tolist()))
-    
-    print(f"Created {len(all_ops)} OrderParameters.")
-    return all_ops
+def compute_streaming_fisher(df_iterator_factory, target_col):
+    """Memory-efficient Fisher scoring using dynamic class initialization."""
+    print("Pass 1: Filtering features via Streaming Fisher Score...")
+    stats = {} # {feature: {class_id: [count, sum, sum_sq]}}
+    global_sum = {}
+    global_sum_sq = {}
+    total_count = 0
 
-def run_amino(all_ops, max_outputs=5, bins=10):
-    """
-    Runs the AMINO algorithm to find the final reduced set of features.
-    """
-    print(f"Running AMINO with max_outputs={max_outputs}, bins={bins}...")
-    gc.collect()
-    # Explicitly disable file output by passing None if supported
-    final_ops = amino.find_ops(all_ops, max_outputs, bins, distortion_filename=None)
-    
-    print("\nAMINO selected features:")
-    for op in final_ops:
-        print(op)
+    for chunk in df_iterator_factory():
+        feature_cols = [c for c in get_feature_cols(chunk) if c != target_col]
+        # Force integer classes to prevent KeyError/Type Mismatch
+        y = chunk[target_col].astype(int).values
+        current_chunk_classes = np.unique(y)
+
+        for col in feature_cols:
+            if col not in stats:
+                stats[col] = {}
+                global_sum[col] = 0.0
+                global_sum_sq[col] = 0.0
+
+            for cls in current_chunk_classes:
+                cls_int = int(cls)
+                if cls_int not in stats[col]:
+                    stats[col][cls_int] = [0, 0.0, 0.0]
+
+            x = chunk[col].values
+            global_sum[col] += np.sum(x)
+            global_sum_sq[col] += np.sum(x**2)
+
+            for cls in current_chunk_classes:
+                cls_int = int(cls)
+                mask = (y == cls_int)
+                cls_data = x[mask]
+                if len(cls_data) > 0:
+                    stats[col][cls_int][0] += len(cls_data)
+                    stats[col][cls_int][1] += np.sum(cls_data)
+                    stats[col][cls_int][2] += np.sum(cls_data**2)
         
-    # Removed distortion summary saving
+        total_count += len(chunk)
+
+    # Compute Final Scores
+    fisher_scores = {}
+    for col in stats:
+        m_total = global_sum[col] / total_count
+        num, den = 0.0, 0.0
+        for cls, (n_i, s_i, ss_i) in stats[col].items():
+            if n_i < 2: continue
+            m_i = s_i / n_i
+            num += n_i * (m_i - m_total)**2
+            den += (ss_i - (s_i**2 / n_i)) # Within-class SS
+        fisher_scores[col] = num / (den + 1e-12)
+
+    return pd.Series(fisher_scores).sort_values(ascending=False)
+
+# --- BPSO PROBLEM CLASS ---
+
+class SVMFeatureSelection(Problem):
+    def __init__(self, X_train, y_train, alpha=0.95):
+        # dimension = number of candidate features
+        super().__init__(dimension=X_train.shape[1], lower=0, upper=1)
+        self.X_train, self.y_train = X_train, y_train
+        self.alpha = alpha
+
+    def _evaluate(self, x):
+        selected = x > 0.5
+        if selected.sum() == 0: 
+            return 1.0 # Maximum penalty for selecting zero features
         
-    return final_ops
-
-def run_fisher_amino_workflow(df, target_col='class', n_feat_amino=5, bins_amino=10):
-    """
-    Orchestrates the Fisher-AMINO feature selection workflow.
-    Accepts DataFrame or Iterator[DataFrame].
-    Returns Iterator[DataFrame] with selected features.
-    """
-    
-    # 0. Handle Iterator -> Full DataFrame
-    if isinstance(df, Iterable) and not isinstance(df, pd.DataFrame):
-        print("Consuming DataFrame iterator for Fisher-AMINO...")
-        df = pd.concat(df, ignore_index=True)
-
-    # Validation
-    if target_col not in df.columns:
-        raise ValueError(f"Target column '{target_col}' not found in dataset columns: {df.columns.tolist()}")
-
-    # 1. Calculate Fisher Scores
-    scores, indices = calculate_fisher_scores(df, target_col)
-    
-    # 2. Find optimal number of features (Kneedle)
-    n_feat_optimal, df_scores_sorted = find_optimal_n_feat(scores)
-    
-    # 3. Reduce features for AMINO
-    X = df.drop(target_col, axis=1)
-    # The indices in 'indices' are the column indices of X in descending order of Fisher score
-    reduced_X = X.iloc[:, indices[0:n_feat_optimal]]
-    
-    # 4. Prepare OPs
-    all_ops = prepare_amino_input(reduced_X)
-    
-    # 5. Run AMINO
-    final_ops = run_amino(all_ops, max_outputs=n_feat_amino, bins=bins_amino)
-    
-    # 6. Final preparation
-    final_col_names = [str(op) for op in final_ops]
-    df_amino = reduced_X[final_col_names].copy()
-    df_amino[target_col] = df[target_col].values
-    
-    print(f"Fisher-AMINO completed. Selected {len(final_col_names)} features.")
-    
-    # Return as iterator
-    return [df_amino]
-
-def main():
-    parser = argparse.ArgumentParser(description='Refactored Fisher-AMINO Feature Selection')
-    parser.add_argument('--dataset', type=str, default='sample_CA_post_variance.csv', help='Input CSV dataset')
-    parser.add_argument('--target', type=str, default='class', help='Target column name')
-    parser.add_argument('--max_outputs', type=int, default=5, help='Max outputs for AMINO')
-    parser.add_argument('--bins', type=int, default=10, help='Number of bins for AMINO')
-    
-    args = parser.parse_args()
-    
-    if not os.path.exists(args.dataset):
-        print(f"Error: Dataset {args.dataset} not found.")
-        return
-
-    print(f"Loading dataset: {args.dataset}")
-    df_iter = [pd.read_csv(args.dataset)] # Simulate iterator
-    
-    try:
-        result_iter = run_fisher_amino_workflow(
-            df=df_iter,
-            target_col=args.target,
-            n_feat_amino=args.max_outputs,
-            bins_amino=args.bins
-        )
-        for res_df in result_iter:
-            print(f"Result shape: {res_df.shape}")
-            # res_df.to_csv('fisher_amino_result.csv', index=False)
+        # Use a fast LinearSVC with Bagging to handle variance
+        clf = OneVsRestClassifier(BaggingClassifier(
+            LinearSVC(dual=False, tol=1e-3), 
+            n_jobs=-1, n_estimators=5, max_samples=0.8
+        ))
+        
+        try:
+            # Objective: Maximize Accuracy and Minimize feature count
+            acc = cross_val_score(clf, self.X_train[:, selected], self.y_train, cv=3).mean()
+        except:
+            return 1.0
             
-    except ValueError as e:
-        print(f"Error: {e}")
+        # Fitness: Weighted average of error and feature ratio
+        error_rate = 1 - acc
+        feature_penalty = selected.sum() / self.dimension
+        return self.alpha * error_rate + (1 - self.alpha) * feature_penalty
+
+# --- MAIN PIPELINE ---
+
+def run_bpso_pipeline(df_iterator_factory, target_col='class', candidate_limit=150, bpso_iters=30):
+    """
+    Three-Pass BPSO Pipeline:
+    1. Pass 1: Streaming Fisher Score to find top N candidates.
+    2. Pass 2: Extract only candidates into RAM.
+    3. Optimization: Run BPSO on the RAM-resident slice.
+    """
+    
+    # 1. Narrow the search space (Pass 1)
+    fisher_scores = compute_streaming_fisher(df_iterator_factory, target_col)
+    candidates = fisher_scores.index[:candidate_limit].tolist()
+    
+    # 2. Extract Narrow Slice into RAM (Pass 2)
+    print(f"Loading top {len(candidates)} candidates for BPSO optimization...")
+    data_list = []
+    # Include metadata like 'frame_number' for tracking if needed
+    cols_to_load = candidates + [target_col]
+    
+    for chunk in df_iterator_factory():
+        # Force integer target to match Pass 1
+        chunk[target_col] = chunk[target_col].astype(int)
+        data_list.append(chunk[cols_to_load])
+    
+    narrow_df = pd.concat(data_list, ignore_index=True)
+    del data_list # Free memory
+    gc.collect()
+
+    X = narrow_df[candidates].values
+    y = narrow_df[target_col].values
+
+    # 3. Run BPSO Optimization
+    print(f"BPSO: Optimizing subset of {len(candidates)} features...")
+    problem = SVMFeatureSelection(X, y)
+    task = Task(problem, max_iters=bpso_iters)
+    algorithm = ParticleSwarmOptimization(population_size=15)
+    
+    best_x, _ = algorithm.run(task)
+    final_mask = best_x > 0.5
+    final_features = [candidates[i] for i, m in enumerate(final_mask) if m]
+    
+    print(f"BPSO selected {len(final_features)} elite features.")
+
+    return narrow_df[final_features + [target_col]]
 
 if __name__ == "__main__":
-    main()
+    pass
