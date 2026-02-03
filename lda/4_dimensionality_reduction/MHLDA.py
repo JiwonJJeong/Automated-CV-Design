@@ -60,38 +60,72 @@ def run_mhlda(
     ### STEP 4. Compute the d-dimensional mean vectors
     ### Here, we calculate #num_class column vectors, each of which contains #num_descriptor elements (means)
     np.set_printoptions(precision=4)
+    # Get unique classes and handle arbitrary labels
+    unique_classes = np.unique(y)
+    class_to_idx = {cls: idx for idx, cls in enumerate(unique_classes)}
+    
     mean_vectors = []
-    for cl in range(1,num_class+1):
-        mean_vectors.append(np.mean(X[y==cl], axis=0))                
-        print(f'Mean Vector class {cl}: {mean_vectors[cl-1]}')
+    for cl in unique_classes:
+        mean_vectors.append(np.mean(X[y == cl], axis=0))
+        print(f'Mean Vector class {cl}: {mean_vectors[class_to_idx[cl]]}')
 
     ### STEP 5. Compute the scatter matrices
-    ### 5-1. Within-class scatter matrix SW
-    S_W = np.zeros((num_descriptor,num_descriptor))
-    S_W_int = np.zeros((num_descriptor,num_descriptor))
-    for cl,mv in zip(range(1,num_class+1), mean_vectors):
-        class_sc_mat = np.zeros((num_descriptor,num_descriptor))
-        for row in X[y==cl]:
-            row, mv = row.reshape(num_descriptor,1), mv.reshape(num_descriptor,1)   # make column vectors
-            class_sc_mat += (row-mv).dot((row-mv).T)
-        S_W_int += np.linalg.inv(class_sc_mat)                                      # sum class scatter matrices
-    S_W = np.linalg.inv(S_W_int)
-
+    ### 5-1. Within-class scatter matrix SW (Heteroscedastic)
+    # For heteroscedastic LDA, we use weighted sum of individual class covariances
+    S_W = np.zeros((num_descriptor, num_descriptor))
+    
+    for cl, mv in zip(unique_classes, mean_vectors):
+        class_sc_mat = np.zeros((num_descriptor, num_descriptor))
+        class_data = X[y == cl]
+        
+        # Compute class covariance matrix
+        if len(class_data) > 1:
+            centered_data = class_data - mv.reshape(1, -1)
+            class_sc_mat = np.dot(centered_data.T, centered_data)
+            
+            # Add regularization for numerical stability
+            class_sc_mat += np.eye(num_descriptor) * 1e-7
+            
+            # Weight by class size (inverse covariance weighting)
+            class_weight = len(class_data) / len(X)
+            try:
+                inv_class_sc_mat = np.linalg.inv(class_sc_mat)
+                S_W += class_weight * inv_class_sc_mat
+            except np.linalg.LinAlgError:
+                # If singular, use pseudo-inverse
+                S_W += class_weight * np.linalg.pinv(class_sc_mat)
+    
     print('within-class Scatter Matrix:\n', S_W)
 
     ### 5-2. Between-class scatter matrix SB
-    overall_mean = np.mean(X, axis=0)                               
-    S_B = np.zeros((num_descriptor,num_descriptor))
-    for i,mean_vec in enumerate(mean_vectors):                      
-        n = X[y==i+1,:].shape[0]                                    
-        mean_vec = mean_vec.reshape(num_descriptor,1)               
-        overall_mean = overall_mean.reshape(num_descriptor,1)       
-        S_B += n*(mean_vec-overall_mean).dot((mean_vec-overall_mean).T)
+    overall_mean = np.mean(X, axis=0) 
+    S_B = np.zeros((num_descriptor, num_descriptor))
+    
+    for i, cl in enumerate(unique_classes):
+        class_data = X[y == cl]
+        n = len(class_data)
+        mean_vec = mean_vectors[i].reshape(num_descriptor, 1)
+        overall_mean_vec = overall_mean.reshape(num_descriptor, 1)
+        S_B += n * (mean_vec - overall_mean_vec).dot((mean_vec - overall_mean_vec).T)
         
     print('between-class Scatter Matrix:\n', S_B)
 
-    ### STEP 6. Solve the generalized eigenvalue problem for the matrix SW^-1.SB
-    eig_vals, eig_vecs = np.linalg.eig(np.linalg.inv(S_W).dot(S_B))
+    # Validate num_eigenvector against theoretical limit
+    max_possible_ld = min(num_descriptor, len(unique_classes) - 1)
+    if num_eigenvector > max_possible_ld:
+        print(f"Warning: Requested {num_eigenvector} LDs, but max is {max_possible_ld}. Adjusting.")
+        num_eigenvector = max_possible_ld
+    
+    if num_eigenvector < 1:
+        raise ValueError("Cannot perform MHLDA: not enough classes or features.")
+    
+    # Solve generalized eigenvalue problem with regularization
+    try:
+        eig_vals, eig_vecs = np.linalg.eig(np.linalg.inv(S_W).dot(S_B))
+    except np.linalg.LinAlgError:
+        # If S_W is singular, use pseudo-inverse
+        eig_vals, eig_vecs = np.linalg.eig(np.linalg.pinv(S_W).dot(S_B))
+        
     for i in range(len(eig_vals)):
         eigvec_sc = eig_vecs[:,i].reshape(num_descriptor,1)         # [:,i] = all rows and column i
         print(f'\nEigenvector {i+1}: \n{eigvec_sc.real}')
@@ -113,8 +147,11 @@ def run_mhlda(
 
     print('Variance explained:\n')
     eigv_sum = sum(eig_vals)
-    for i,j in enumerate(eig_pairs):
-        print(f'eigenvalue {i+1}: {(j[0]/eigv_sum).real:.2%}')
+    if eigv_sum > 1e-10:  # Avoid division by zero
+        for i,j in enumerate(eig_pairs):
+            print(f'eigenvalue {i+1}: {(j[0]/eigv_sum).real:.2%}')
+    else:
+        print('Eigenvalues sum is too small for meaningful percentage calculation')
 
     W = np.concatenate([eig_pairs[i][1].reshape(num_descriptor,1) for i in range(num_eigenvector)], axis=1)
     print('Matrix W:\n', W.real)
@@ -123,8 +160,9 @@ def run_mhlda(
     X_ldaz = X.dot(W.real) 
     y_output = df[target_col].values
 
-    # Create result DataFrame
-    result_df = pd.DataFrame(X_ldaz, columns=['LD1', 'LD2'])
+    # Create result DataFrame with dynamic column names
+    cols = [f'LD{i+1}' for i in range(num_eigenvector)]
+    result_df = pd.DataFrame(X_ldaz, columns=cols)
     result_df[target_col] = y_output
     
     if save_csv:

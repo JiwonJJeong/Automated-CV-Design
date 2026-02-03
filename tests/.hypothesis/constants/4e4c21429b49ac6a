@@ -1,0 +1,4 @@
+# file: /home/jiwonjjeong/gk-lab/Automated-CV-Design/lda/data_access.py
+# hypothesis_version: 6.151.4
+
+[144, 1024, 10000, '**/*_pairwise_dist.*', '...', '.h5', '.npy', 'Columns:', 'Conversion complete.', 'DATA_BASE_DIR', 'First factory call:', 'First row Sample:\n', 'Second factory call:', '_', '__main__', 'a', 'blosc', 'column_names', 'construct', 'data', 'distances', 'dtype', 'e', 'frame_number', 'gzip', 'h5', 'npy', 'path', 'r', 'replica', 's', 'shape', 'size_mb', 'subconstruct', 'table', 'time', 'time.npy', 'times', 'type', 'w']

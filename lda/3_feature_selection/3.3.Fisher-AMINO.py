@@ -1,49 +1,50 @@
+import amino_fast_mod as amino
 import numpy as np
 import pandas as pd
-import h5py
 import gc
-from sklearn.model_selection import train_test_split, cross_val_score
-from sklearn.svm import LinearSVC
-from sklearn.multiclass import OneVsRestClassifier
-from sklearn.ensemble import BaggingClassifier
-from niapy.problems import Problem
-from niapy.task import Task
-from niapy.algorithms.basic import ParticleSwarmOptimization
+from kneed import KneeLocator
 
 # Import refactored helpers
-from data_access import get_feature_cols, METADATA_COLS
+from data_access import create_dataframe_factory, get_feature_cols, METADATA_COLS
 
-# --- PASS 1: STREAMING FISHER ---
-
-def compute_streaming_fisher(df_iterator_factory, target_col):
-    """Memory-efficient Fisher scoring using dynamic class initialization."""
-    print("Pass 1: Filtering features via Streaming Fisher Score...")
+def compute_sequential_fisher(df_iterator_factory, target_col):
+    """
+    Pass 1: Computes Fisher Scores using a memory-efficient approach.
+    Since Fisher Score involves means and variances per class, we accumulate 
+    sums and squared sums chunk-by-chunk.
+    """
+    print("Calculating Fisher scores sequentially...")
+    
     stats = {} # {feature: {class_id: [count, sum, sum_sq]}}
     global_sum = {}
     global_sum_sq = {}
     total_count = 0
 
+    # Pass 1: Accumulate Statistics
     for chunk in df_iterator_factory():
         feature_cols = [c for c in get_feature_cols(chunk) if c != target_col]
-        # Force integer classes to prevent KeyError/Type Mismatch
         y = chunk[target_col].astype(int).values
         current_chunk_classes = np.unique(y)
 
         for col in feature_cols:
+            # 1. Ensure the feature exists in stats
             if col not in stats:
                 stats[col] = {}
                 global_sum[col] = 0.0
                 global_sum_sq[col] = 0.0
 
+            # 2. Ensure EVERY class in this chunk exists for this feature
             for cls in current_chunk_classes:
                 cls_int = int(cls)
                 if cls_int not in stats[col]:
                     stats[col][cls_int] = [0, 0.0, 0.0]
 
+            # 3. Accumulate global stats
             x = chunk[col].values
             global_sum[col] += np.sum(x)
             global_sum_sq[col] += np.sum(x**2)
 
+            # 4. Accumulate per-class stats
             for cls in current_chunk_classes:
                 cls_int = int(cls)
                 mask = (y == cls_int)
@@ -55,96 +56,81 @@ def compute_streaming_fisher(df_iterator_factory, target_col):
         
         total_count += len(chunk)
 
-    # Compute Final Scores
+    # Pass 2: Compute Scores
+    # Fisher Score = sum(n_i * (mean_i - mean_total)^2) / sum(n_i * var_i)
     fisher_scores = {}
     for col in stats:
         m_total = global_sum[col] / total_count
-        num, den = 0.0, 0.0
+        
+        numerator = 0.0
+        denominator = 0.0
+        
         for cls, (n_i, s_i, ss_i) in stats[col].items():
             if n_i < 2: continue
             m_i = s_i / n_i
-            num += n_i * (m_i - m_total)**2
-            den += (ss_i - (s_i**2 / n_i)) # Within-class SS
-        fisher_scores[col] = num / (den + 1e-12)
+            # Sample variance formula
+            var_i = (ss_i - (s_i**2 / n_i)) / (n_i - 1)
+            
+            numerator += n_i * (m_i - m_total)**2
+            denominator += n_i * var_i
+            
+        fisher_scores[col] = numerator / (denominator + 1e-12)
 
     return pd.Series(fisher_scores).sort_values(ascending=False)
 
-# --- BPSO PROBLEM CLASS ---
-
-class SVMFeatureSelection(Problem):
-    def __init__(self, X_train, y_train, alpha=0.95):
-        # dimension = number of candidate features
-        super().__init__(dimension=X_train.shape[1], lower=0, upper=1)
-        self.X_train, self.y_train = X_train, y_train
-        self.alpha = alpha
-
-    def _evaluate(self, x):
-        selected = x > 0.5
-        if selected.sum() == 0: 
-            return 1.0 # Maximum penalty for selecting zero features
-        
-        # Use a fast LinearSVC with Bagging to handle variance
-        clf = OneVsRestClassifier(BaggingClassifier(
-            LinearSVC(dual=False, tol=1e-3), 
-            n_jobs=-1, n_estimators=5, max_samples=0.8
-        ))
-        
-        try:
-            # Objective: Maximize Accuracy and Minimize feature count
-            acc = cross_val_score(clf, self.X_train[:, selected], self.y_train, cv=3).mean()
-        except:
-            return 1.0
-            
-        # Fitness: Weighted average of error and feature ratio
-        error_rate = 1 - acc
-        feature_penalty = selected.sum() / self.dimension
-        return self.alpha * error_rate + (1 - self.alpha) * feature_penalty
-
-# --- MAIN PIPELINE ---
-
-def run_bpso_pipeline(df_iterator_factory, target_col='class', candidate_limit=150, bpso_iters=30):
+def extract_candidates_only(df_iterator, target_col, candidates):
     """
-    Three-Pass BPSO Pipeline:
-    1. Pass 1: Streaming Fisher Score to find top N candidates.
-    2. Pass 2: Extract only candidates into RAM.
-    3. Optimization: Run BPSO on the RAM-resident slice.
+    Pass 2: Extracts only high-signal features and essential metadata for AMINO.
     """
-    
-    # 1. Narrow the search space (Pass 1)
-    fisher_scores = compute_streaming_fisher(df_iterator_factory, target_col)
-    candidates = fisher_scores.index[:candidate_limit].tolist()
-    
-    # 2. Extract Narrow Slice into RAM (Pass 2)
-    print(f"Loading top {len(candidates)} candidates for BPSO optimization...")
+    print(f"Loading {len(candidates)} candidate features into memory...")
     data_list = []
-    # Include metadata like 'frame_number' for tracking if needed
-    cols_to_load = candidates + [target_col]
+    cols_to_keep = candidates + [target_col] + [c for c in ['time', 'frame_number'] if c in METADATA_COLS]
     
-    for chunk in df_iterator_factory():
-        # Force integer target to match Pass 1
-        chunk[target_col] = chunk[target_col].astype(int)
-        data_list.append(chunk[cols_to_load])
+    for chunk in df_iterator:
+        available = [c for c in cols_to_keep if c in chunk.columns]
+        data_list.append(chunk[available])
+        
+    return pd.concat(data_list, ignore_index=True)
+
+def run_fisher_amino_pipeline(df_iterator_factory, target_col='class', max_outputs=5):
+    """
+    Integrated Fisher-AMINO Pipeline.
+    """
+    # 1. Fisher Scores (Sequential)
+    fisher_s = compute_sequential_fisher(df_iterator_factory, target_col)
     
-    narrow_df = pd.concat(data_list, ignore_index=True)
-    del data_list # Free memory
+    # 2. Knee Detection
+    y_vals = fisher_s.values
+    kn = KneeLocator(range(1, len(y_vals) + 1), y_vals, curve='convex', direction='decreasing', S=1.0)
+    threshold = kn.knee_y if kn.knee_y is not None else 0.0
+    candidate_features = fisher_s[fisher_s >= threshold].index.tolist()
+    
+    print(f"Fisher Knee: {threshold:.4f} | Candidates: {len(candidate_features)}")
+
+    # 3. Memory Cap
+    if len(candidate_features) > 250:
+        candidate_features = fisher_s.head(250).index.tolist()
+
+    # 4. Extract for AMINO
+    df_amino_input = extract_candidates_only(df_iterator_factory(), target_col, candidate_features)
     gc.collect()
 
-    X = narrow_df[candidates].values
-    y = narrow_df[target_col].values
-
-    # 3. Run BPSO Optimization
-    print(f"BPSO: Optimizing subset of {len(candidates)} features...")
-    problem = SVMFeatureSelection(X, y)
-    task = Task(problem, max_iters=bpso_iters)
-    algorithm = ParticleSwarmOptimization(population_size=15)
+    # 5. AMINO Redundancy Reduction
+    print("Running AMINO...")
+    ops = [amino.OrderParameter(name, df_amino_input[name].tolist()) for name in candidate_features]
     
-    best_x, _ = algorithm.run(task)
-    final_mask = best_x > 0.5
-    final_features = [candidates[i] for i, m in enumerate(final_mask) if m]
-    
-    print(f"BPSO selected {len(final_features)} elite features.")
+    try:
+        final_ops = amino.find_ops(ops, max_outputs=max_outputs, bins=20, distortion_filename=None)
+        final_names = [str(op) for op in final_ops]
+    except Exception as e:
+        print(f"AMINO failed: {e}. Falling back to top Fisher features.")
+        final_names = candidate_features[:max_outputs]
 
-    return narrow_df[final_features + [target_col]]
+    return df_amino_input[final_names + [target_col]]
 
 if __name__ == "__main__":
+    # Example usage with data_access factory
+    # from data_access import create_dataframe_factory
+    # factory = create_dataframe_factory(base_dir="./data", chunk_size=10000)
+    # result_df = run_fisher_amino_pipeline(factory, target_col='class')
     pass

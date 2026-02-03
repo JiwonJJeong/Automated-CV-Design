@@ -57,13 +57,24 @@ def run_pca(
     y = df[target_col].values
     print(X)
 
+    # Validate num_eigenvector against available features
+    max_possible_pc = min(num_descriptor, num_eigenvector)
+    if num_eigenvector > max_possible_pc:
+        print(f"Warning: Requested {num_eigenvector} PCs, but max is {max_possible_pc}. Adjusting.")
+        num_eigenvector = max_possible_pc
+    
+    if num_eigenvector < 1:
+        raise ValueError("Cannot perform PCA: no features available.")
+
     ### STEP 3. Perform PCA
     pca = PCA(n_components=num_eigenvector)
     pca_X = pca.fit_transform(X)
     print('Shape before PCA: ', X.shape)
     print('Shape after PCA: ', pca_X.shape)
 
-    pca_df = pd.DataFrame(data=pca_X, columns=['PC1', 'PC2'])
+    # Create result DataFrame with dynamic column names
+    cols = [f'PC{i+1}' for i in range(num_eigenvector)]
+    pca_df = pd.DataFrame(data=pca_X, columns=cols)
     pca_df['class'] = y
     
     if save_csv:
