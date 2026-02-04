@@ -3,3 +3,5 @@ __pycache__/
 /tests/2_feature_extraction/sample_CA_post_variance.csv
 
 data/
+
+.hypothesis/
