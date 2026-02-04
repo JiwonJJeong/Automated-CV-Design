@@ -298,43 +298,7 @@ class TestPCAEnhanced:
 
     # --- Integration Tests ---
     
-    def test_integration_with_real_data(self):
-        """Integration test using real data."""
-        try:
-            # Try enhanced data_access first
-            df = data_access.create_dataframe_factory('../data/dist_maps', chunk_size=100)()
-            first_chunk = next(df)
-            
-            if len(first_chunk) > 0:
-                result_iter = pca_mod.run_pca(first_chunk, num_eigenvector=2, target_col='class')
-                result_df = next(result_iter)
-                
-                assert isinstance(result_df, pd.DataFrame)
-                assert 'class' in result_df.columns
-                assert 'PC1' in result_df.columns
-                assert 'PC2' in result_df.columns
-            else:
-                pytest.skip("No real data available")
-        except (FileNotFoundError, Exception):
-            # Fall back to utils integration
-            if utils is not None:
-                try:
-                    df = utils.get_mpso_data()
-                    df = utils.assign_classes(df, start_label=0)  # PCA uses 0, 1, 2 labels
-                    
-                    result_iter = pca_mod.run_pca(df, num_eigenvector=2, target_col='class')
-                    result_df = next(result_iter)
-                    
-                    assert isinstance(result_df, pd.DataFrame)
-                    assert 'class' in result_df.columns
-                    assert 'PC1' in result_df.columns
-                    assert 'PC2' in result_df.columns
-                    assert len(result_df) == len(df)
-                except FileNotFoundError:
-                    pytest.skip("Real test data not available")
-            else:
-                pytest.skip("Real test data not available")
-
+    
     def test_integration_with_utils_data(self):
         """Integration test using external utility data functions."""
         if utils is None:

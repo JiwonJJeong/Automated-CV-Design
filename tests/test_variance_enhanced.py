@@ -215,24 +215,7 @@ class TestVarianceEnhanced:
             result_iter = variance_mod.variance_filter_pipeline(factory, show_plot=False)
             next(result_iter)
 
-    def test_integration_with_real_data(self):
-        """Integration test using real data."""
-        try:
-            # Try to get real data if available
-            df = data_access.create_dataframe_factory('../data/dist_maps', chunk_size=100)()
-            first_chunk = next(df)
-            
-            if len(first_chunk) > 0:
-                result_iter = variance_mod.variance_filter_pipeline(lambda: (first_chunk,), show_plot=False)
-                result_df = next(result_iter)
-                
-                assert isinstance(result_df, pd.DataFrame)
-                assert 'class' in result_df.columns
-            else:
-                pytest.skip("No real data available")
-        except (FileNotFoundError, Exception):
-            pytest.skip("Real test data not available")
-
+    
     def test_reference_output_comparison(self):
         """Test against reference output using exact same process as reference notebook."""
         ref_file = os.path.join(os.path.dirname(__file__), '2_feature_extraction', 'sample_CA_post_variance.csv')

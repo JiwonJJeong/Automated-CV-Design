@@ -282,24 +282,7 @@ class TestMPSOEnhanced:
         assert len(result) == 0
         assert len(result.columns) == 0  # Completely empty, no columns
 
-    def test_integration_with_real_data(self):
-        """Integration test using real data."""
-        try:
-            # Try to get real data if available
-            df = data_access.create_dataframe_factory('../data/dist_maps', chunk_size=100)()
-            first_chunk = next(df)
-            
-            if len(first_chunk) > 0:
-                result = mpso.run_mpso_pipeline(
-                    lambda: (first_chunk,), dims=2, mpso_iters=3, seed=42
-                )
-                assert isinstance(result, pd.DataFrame)
-                assert 'class' in result.columns
-            else:
-                pytest.skip("No real data available")
-        except (FileNotFoundError, Exception):
-            pytest.skip("Real test data not available")
-
+    
     def test_reference_output_comparison(self):
         """Test against reference output using exact same process as reference generation."""
         ref_file = os.path.join(os.path.dirname(__file__), '3_feature_selection', 'mpso.csv')

@@ -16,11 +16,11 @@ This directory contains comprehensive tests following the MHLDA test pattern, wh
 - Robustness testing across many data patterns
 - Examples: `test_property_scaling_invariance`, `test_property_output_dimensions`
 
-### 3. **Integration Tests with Real Data**
-- End-to-end pipeline validation
-- Real-world data compatibility
-- Reference output comparison
-- Examples: `test_integration_with_real_data`, `test_reference_output_comparison`
+### 3. **Reference Output Comparison Tests**
+- Exact validation against known good outputs
+- Uses same input data and parameters as reference generation
+- No synthetic fallback - tests fail properly when data is missing
+- Examples: `test_reference_output_comparison`
 
 ## 🗂️ Merged Test Files
 
@@ -83,8 +83,8 @@ pytest tests/test_*::Test*Properties -v
 pytest tests/test_chi_sq_amino.py::TestChiSqAminoProperties -v
 pytest tests/test_fisher_amino.py::TestFisherAminoProperties -v
 
-# Run only integration tests
-pytest tests/test_* -k "integration" -v
+# Run only integration tests (pipeline helper only)
+pytest tests/test_pipeline_helper.py -k "integration" -v
 ```
 
 ### Generate Reference Outputs
@@ -111,10 +111,12 @@ pytest tests/test_flda.py::TestFLDA::test_reference_output_comparison -v -s
 - Expected: 1-5 seconds per test
 
 ### **Integration Tests (Slower)**
-- Real data compatibility
+- Real data compatibility (pipeline helper only)
 - End-to-end pipeline validation
 - Reference output comparison
 - Expected: 5-30 seconds per test (with timeouts)
+
+> **Note**: Integration tests with real data have been removed from all algorithm test files except `test_pipeline_helper.py` to focus on reference output validation and reduce test execution time.
 
 ## 🔧 Reference Outputs
 

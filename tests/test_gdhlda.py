@@ -350,24 +350,7 @@ class TestGDHLDAEnhanced:
             assert isinstance(result_df, pd.DataFrame)
             mock_run.assert_called_once()
 
-    def test_integration_with_real_data(self):
-        """Integration test using real data."""
-        try:
-            # Try to get real data if available
-            df = data_access.create_dataframe_factory('../data/dist_maps', chunk_size=100)()
-            first_chunk = next(df)
-            
-            if len(first_chunk) > 0 and first_chunk['class'].nunique() >= 2:
-                result_iter = gdhlda_mod.run_gdhlda(first_chunk, num_eigenvector=2, target_col='class')
-                result_df = next(result_iter)
-                
-                assert isinstance(result_df, pd.DataFrame)
-                assert 'class' in result_df.columns
-            else:
-                pytest.skip("No suitable real data available")
-        except (FileNotFoundError, Exception):
-            pytest.skip("Real test data not available")
-
+    
     def test_integration_with_utils_data(self):
         """Integration test using external utility data functions."""
         if utils is None:

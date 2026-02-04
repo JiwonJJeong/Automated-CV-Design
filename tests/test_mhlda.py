@@ -193,24 +193,7 @@ class TestMHLDA:
             # These errors are acceptable for empty data
             pass
     
-    def test_integration_with_real_data(self):
-        """Integration test using real data."""
-        try:
-            df = utils.get_mpso_data()
-            df = utils.assign_classes(df, start_label=1)
-            
-            result_iter = mhlda_mod.run_mhlda(df, num_eigenvector=2, target_col='class')
-            result_df = next(result_iter)
-            
-            assert isinstance(result_df, pd.DataFrame)
-            assert 'class' in result_df.columns
-            assert 'LD1' in result_df.columns
-            assert 'LD2' in result_df.columns
-            assert len(result_df) == len(df)
-            
-        except FileNotFoundError:
-            pytest.skip("Real test data not available")
-    
+        
     def test_reference_output_comparison(self):
         """Test against reference output using exact same process as reference notebook."""
         ref_file = os.path.join(os.path.dirname(__file__), '4_dimensionality_reduction', 'MHLDA.csv')
