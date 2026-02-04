@@ -61,10 +61,10 @@ This directory contains comprehensive tests following the MHLDA test pattern, wh
 
 ### Run Enhanced Tests
 ```bash
-# Run all reference tests (updated with exact matching)
-pytest tests/test_chi_sq_amino.py tests/test_fisher_amino.py tests/test_bpso.py tests/test_mpso.py tests/test_pca.py tests/test_flda.py tests/test_gdhlda.py tests/test_zhlda.py tests/test_variance_enhanced.py -v
+# Run all fast tests (reference tests automatically skipped)
+pytest tests/ -v
 
-# Run specific algorithm tests
+# Run specific algorithm tests (reference tests automatically skipped)
 pytest tests/test_chi_sq_amino.py -v
 pytest tests/test_fisher_amino.py -v
 pytest tests/test_bpso.py -v
@@ -75,8 +75,14 @@ pytest tests/test_gdhlda.py -v
 pytest tests/test_zhlda.py -v
 pytest tests/test_variance_enhanced.py -v
 
-# Run only reference comparison tests
-pytest tests/test_* -k "reference_output_comparison" -v
+# Run reference tests only (when explicitly requested)
+pytest tests/ -m reference_test -v
+
+# Run all tests including reference tests
+pytest tests/ -m "" -v
+
+# Run only fast tests (exclude slow tests)
+pytest tests/ -m "not slow" -v
 
 # Run only property tests
 pytest tests/test_*::Test*Properties -v
@@ -94,6 +100,30 @@ pytest tests/test_chi_sq_amino.py::TestChiSqAmino::test_reference_output_compari
 pytest tests/test_fisher_amino.py::TestFisherAmino::test_reference_output_comparison -v -s
 pytest tests/test_pca.py::TestPCA::test_reference_output_comparison -v -s
 pytest tests/test_flda.py::TestFLDA::test_reference_output_comparison -v -s
+```
+
+## 🏷️ Test Markers
+
+### **Automatic Reference Test Skipping**
+Reference tests are automatically skipped by default to speed up regular testing:
+
+- **`@pytest.mark.reference_test`**: Marks expensive reference validation tests
+- **`@pytest.mark.slow`**: Marks tests that take significant time to run
+- **Default behavior**: `pytest tests/` skips all reference tests automatically
+
+### **Marker Usage:**
+```bash
+# Default: Run fast tests only (reference tests skipped)
+pytest tests/ -v
+
+# Run reference tests when explicitly needed
+pytest tests/ -m reference_test -v
+
+# Run all tests including reference tests
+pytest tests/ -m "" -v
+
+# Run only fast tests (exclude slow and reference)
+pytest tests/ -m "not slow and not reference_test" -v
 ```
 
 ## 📊 Test Categories

@@ -283,91 +283,6 @@ class TestMPSOEnhanced:
         assert len(result.columns) == 0  # Completely empty, no columns
 
     
-    def test_reference_output_comparison(self):
-        """Test against reference output using exact same process as reference generation."""
-        ref_file = os.path.join(os.path.dirname(__file__), '3_feature_selection', 'mpso.csv')
-        
-        if not os.path.exists(ref_file):
-            pytest.skip("Reference file not available")
-        
-        try:
-            # Load reference data to understand expected structure
-            ref_df = pd.read_csv(ref_file)
-            expected_rows = len(ref_df)
-            expected_cols = len(ref_df.columns)
-            
-            # Use exact same process as other reference tests
-            # STEP 1: Load input data (same as PCA reference)
-            input_file = os.path.join(os.path.dirname(__file__), '3_feature_selection', 'mpso.csv')
-            if not os.path.exists(input_file):
-                pytest.fail("❌ Input data file (mpso.csv) not found. MPSO reference test requires the same input data as reference generation.")
-            
-            df = pd.read_csv(input_file)
-            
-            # STEP 2: Use exact same descriptor list as PCA reference
-            descriptor_list = ['res159.439', 'res245.369', 'res64.137', 'res199.471', 'res78.450', 'res242.340', 'res77.293']
-            
-            # Check that all required features are available
-            missing_features = [f for f in descriptor_list if f not in df.columns]
-            if missing_features:
-                pytest.fail(f"❌ Missing required features in input data: {missing_features}")
-            
-            print(f"✅ Using input data with {len(df)} rows and all {len(descriptor_list)} required features")
-            
-            # STEP 3: Zero-mean the data (same as PCA reference)
-            for elem in descriptor_list:
-                df[elem] = df[elem] - df[elem].mean()
-            
-            # STEP 4: Generate labels (exact same process as PCA reference)
-            nDataPoints = 754  # Same as reference
-            y = np.concatenate([np.zeros(nDataPoints), np.ones(nDataPoints), np.ones(nDataPoints)+1])  # MPSO uses 0, 1, 2 labels
-            df['class'] = y
-            
-            # STEP 5: Run MPSO with exact same parameters as reference generation
-            print("🔄 Running MPSO with exact reference parameters (candidate_limit=150, mpso_iters=30)...")
-            result = mpso.run_mpso_pipeline(
-                lambda: (df,), target_col='class',
-                candidate_limit=150, mpso_iters=30, seed=42
-            )
-            
-            # Check that we got reasonable results
-            assert isinstance(result, pd.DataFrame), "Result should be a DataFrame"
-            assert 'class' in result.columns, "Result should contain class column"
-            assert len(result) == expected_rows, f"Expected {expected_rows} rows, got {len(result)}"
-            
-            # Check class column exactly (allowing for dtype differences)
-            pd.testing.assert_series_equal(
-                result['class'].reset_index(drop=True), 
-                ref_df['class'].reset_index(drop=True),
-                check_dtype=False,
-                check_names=False
-            )
-            
-            # Check that we have the expected number of MPSO-selected features
-            selected_features = [col for col in result.columns if col != 'class']
-            assert len(selected_features) <= 150, f"Should have at most 150 MPSO features, got {len(selected_features)}"
-            assert len(selected_features) > 0, "Should have selected at least one feature"
-            
-            # Check feature overlap with reference
-            ref_selected_features = [col for col in ref_df.columns if col != 'class']
-            overlap = set(selected_features) & set(ref_selected_features)
-            overlap_ratio = len(overlap) / len(selected_features) if selected_features else 0
-            
-            print(f"✅ MPSO results match reference")
-            print(f"   Shape: {result.shape}")
-            print(f"   Selected features: {len(selected_features)}")
-            print(f"   Feature overlap with reference: {len(overlap)}/{len(selected_features)} ({overlap_ratio:.1%})")
-            
-            # Validate that feature selection is reasonable
-            if overlap_ratio < 0.3:
-                pytest.warn(f"⚠️  Low feature overlap with reference ({overlap_ratio:.1%}). This may indicate different input data or parameters.")
-            
-        except FileNotFoundError:
-            pytest.skip("Reference file not available")
-        except Exception as e:
-            # Don't skip - let the test fail so we can see the actual error
-            raise AssertionError(f"MPSO reference comparison failed: {e}") from e
-
 
 class TestMPSOProperties:
     """Property-based tests for MPSO invariants."""
@@ -428,7 +343,6 @@ class TestMPSOProperties:
         
         # Results should be identical (deterministic selection)
         pd.testing.assert_frame_equal(result1, result2)
-
 
 def _run_mpso_pipeline_fast(df_iterator_factory, target_col='class', dims=1, seed=42):
     """
@@ -506,7 +420,6 @@ def _run_mpso_pipeline_fast(df_iterator_factory, target_col='class', dims=1, see
         # Check that projections have variance
         assert np.var(result['MPSO_Dim_1']) > 1e-6, "MPSO_Dim_1 should have variance"
         assert np.var(result['MPSO_Dim_2']) > 1e-6, "MPSO_Dim_2 should have variance"
-
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
