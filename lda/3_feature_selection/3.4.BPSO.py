@@ -15,21 +15,26 @@ from data_access import get_feature_cols, METADATA_COLS
 # --- PASS 1: STREAMING FISHER ---
 
 def compute_streaming_fisher(df_iterator, target_col):
-    """Memory-efficient Fisher scores using a data stream."""
+    """Memory-efficient Fisher scores with numerical stability fixes."""
     print("Pass 1: Filtering features via Streaming Fisher Score...")
     stats = {}
     feature_cols = None
     total_n = 0
 
     for chunk in df_iterator:
+        # Pre-filter: Ensure we only pick numeric columns for features
         if feature_cols is None:
-            # Use same helper logic as Chi-Sq script
-            feature_cols = [c for c in get_feature_cols(chunk) if c != target_col]
+            # Helper to ignore objects/strings which crash Fisher math
+            feature_cols = [c for c in get_feature_cols(chunk) 
+                           if c != target_col and pd.api.types.is_numeric_dtype(chunk[c])]
         
-        y = chunk[target_col].astype(int).values
+        y = chunk[target_col].values
+        # Optimization: Select columns once per chunk
+        X_chunk = chunk[feature_cols].values
+        
         for label in np.unique(y):
             mask = (y == label)
-            data = chunk.loc[mask, feature_cols].values
+            data = X_chunk[mask]
             
             if label not in stats:
                 stats[label] = {'n': 0, 'sum': 0.0, 'sum_sq': 0.0}
@@ -43,6 +48,7 @@ def compute_streaming_fisher(df_iterator, target_col):
     if total_n == 0:
         return pd.Series(dtype=float)
 
+    # --- Aggregation Step ---
     global_sum = sum(s['sum'] for s in stats.values())
     global_mean = global_sum / total_n
     
@@ -50,39 +56,81 @@ def compute_streaming_fisher(df_iterator, target_col):
     den = np.zeros(len(feature_cols))
     
     for label, s in stats.items():
-        m_k = s['sum'] / s['n']
-        ss_within = s['sum_sq'] - (s['sum']**2 / s['n'])
-        num += s['n'] * (m_k - global_mean)**2
+        n_k = s['n']
+        if n_k == 0: continue
+            
+        m_k = s['sum'] / n_k
+        
+        # FIX 1: Numerical Stability for Variance
+        # Clip negative variance to 0.0 to prevent NaNs
+        ss_within = np.maximum(s['sum_sq'] - (s['sum']**2 / n_k), 0.0)
+        
+        num += n_k * (m_k - global_mean)**2
         den += ss_within
     
+    # FIX 2: Handle constant features (den=0)
+    # Add epsilon to denominator to prevent division by zero
     scores = num / (den + 1e-12)
+    
     return pd.Series(scores, index=feature_cols).sort_values(ascending=False)
 
 # --- BPSO PROBLEM CLASS ---
 
 class SVMFeatureSelection(Problem):
     def __init__(self, X_train, y_train, alpha=0.95):
-        super().__init__(dimension=X_train.shape[1], lower=0, upper=1)
-        self.X_train, self.y_train = X_train, y_train
+        # FIX: Explicit float bounds
+        super().__init__(dimension=X_train.shape[1], lower=0.0, upper=1.0)
+        self.X_train = X_train
+        self.y_train = y_train
         self.alpha = alpha
 
     def _evaluate(self, x):
         selected = x > 0.5
-        if selected.sum() == 0: 
+        n_selected = selected.sum()
+        
+        if n_selected == 0: 
             return 1.0
         
+        # Optimization: Reduce estimators to 3 for faster convergence during search
         clf = OneVsRestClassifier(BaggingClassifier(
             LinearSVC(dual=False, tol=1e-3), 
-            n_jobs=-1, n_estimators=5, max_samples=0.8
+            n_jobs=1, # Important: Set inner jobs to 1 to avoid over-subscription if NiaPy parallelizes
+            n_estimators=3, 
+            max_samples=0.8
         ))
         
         try:
-            acc = cross_val_score(clf, self.X_train[:, selected], self.y_train, cv=3).mean()
-        except:
+            unique_labels, label_counts = np.unique(self.y_train, return_counts=True)
+            min_class_size = np.min(label_counts)
+            
+            # FIX 3: Robust CV Strategy
+            if min_class_size < 2:
+                # Cannot do CV with a singleton class. 
+                # Fallback: simple train/test split or penalty.
+                return 1.0 # Penalize solutions that rely on insufficient data
+            
+            # Standard logic: Use 3-fold if possible, otherwise LOO equivalent
+            cv_splits = 3 if min_class_size >= 3 else 2
+            
+            acc = cross_val_score(
+                clf, 
+                self.X_train[:, selected], 
+                self.y_train, 
+                cv=cv_splits, 
+                scoring='accuracy',
+                n_jobs=-1 # Parallelize at the CV level
+            ).mean()
+            
+        except ValueError:
+            # Catch "n_splits=2 cannot be greater than the number of members in each class"
+            return 1.0
+        except Exception:
             return 1.0
             
-        return self.alpha * (1 - acc) + (1 - self.alpha) * (selected.sum() / self.dimension)
-
+        # Objective: Minimize Error (1-acc) + Penalty for feature count
+        score = self.alpha * (1.0 - acc) + (1.0 - self.alpha) * (n_selected / self.dimension)
+        return score
+        
 # --- MAIN PIPELINE ---
 
 def run_bpso_pipeline(df_iterator_factory, target_col='class', candidate_limit=150, bpso_iters=30, seed=None):
