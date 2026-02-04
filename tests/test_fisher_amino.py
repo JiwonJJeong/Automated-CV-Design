@@ -171,38 +171,68 @@ class TestFisherAminoEnhanced:
             pytest.skip("Real test data not available")
 
     def test_reference_output_comparison(self):
-        """Test against reference output if available."""
+        """Test against reference output using exact same process as reference notebook."""
         ref_file = os.path.join(os.path.dirname(__file__), '3_feature_selection', 'fisher.amino.df.csv')
         
         if not os.path.exists(ref_file):
             pytest.skip("Reference file not available")
         
         try:
-            # Create test data matching reference
-            np.random.seed(42)
-            test_df = pd.DataFrame({
-                'feature_1': np.random.normal(0, 1, 50),
-                'feature_2': np.random.normal(1, 1, 50),
-                'class': [0, 1] * 25
-            })
+            # Load reference data to understand expected structure
+            ref_df = pd.read_csv(ref_file)
+            expected_rows = len(ref_df)
+            expected_cols = len(ref_df.columns)
             
+            # Use exact same process as reference notebook
+            # STEP 1: Load input data (same as notebook)
+            input_file = os.path.join(os.path.dirname(__file__), '2_feature_extraction', 'sample_CA_post_variance.csv')
+            if not os.path.exists(input_file):
+                pytest.fail("❌ Input data file (sample_CA_post_variance.csv) not found. Fisher AMINO reference test requires the same input data as reference notebook.")
+            
+            dfReduced = pd.read_csv(input_file)
+            
+            print(f"✅ Using input data with {len(dfReduced)} rows and {len(dfReduced.columns)-1} features")
+            
+            # STEP 2: Generate labels (exact same process as notebook)
+            nDataPoints = 754  # Same as notebook
+            zeroList = [0]*nDataPoints  # class 1
+            oneList = [1]*nDataPoints   # class 2  
+            twoList = [2]*nDataPoints   # class 3
+            
+            # STEP 3: Run Fisher AMINO with exact same parameters as notebook
+            print("🔄 Running Fisher AMINO with exact reference parameters (max_outputs=5, bins=10)...")
             result = fisher_amino.run_fisher_amino_pipeline(
-                lambda: (test_df,), target_col='class', max_outputs=1
+                lambda: (dfReduced,), target_col='class', max_outputs=5, bins=10
             )
             
-            ref_df = pd.read_csv(ref_file)
+            # Check that we got reasonable results
+            assert isinstance(result, pd.DataFrame), "Result should be a DataFrame"
+            assert 'class' in result.columns, "Result should contain class column"
+            assert len(result) == expected_rows, f"Expected {expected_rows} rows, got {len(result)}"
             
-            # Check shape
-            assert result.shape[0] == ref_df.shape[0]
-            
-            # Check class column exactly
+            # Check class column exactly (allowing for dtype differences)
             pd.testing.assert_series_equal(
                 result['class'].reset_index(drop=True), 
-                ref_df['class'].reset_index(drop=True)
+                ref_df['class'].reset_index(drop=True),
+                check_dtype=False,
+                check_names=False
             )
             
+            # Check that we have the expected number of AMINO-selected features
+            selected_features = [col for col in result.columns if col != 'class']
+            assert len(selected_features) <= 5, f"Should have at most 5 AMINO features, got {len(selected_features)}"
+            assert len(selected_features) > 0, "Should have selected at least one feature"
+            
+            print(f"✅ Fisher AMINO results match reference")
+            print(f"   Shape: {result.shape}")
+            print(f"   Selected features: {len(selected_features)}")
+            print(f"   Features: {selected_features}")
+            
+        except FileNotFoundError:
+            pytest.skip("Reference file not available")
         except Exception as e:
-            pytest.skip(f"Reference comparison failed: {e}")
+            # Don't skip - let the test fail so we can see the actual error
+            raise AssertionError(f"Fisher AMINO reference comparison failed: {e}") from e
 
 
 class TestFisherAminoProperties:

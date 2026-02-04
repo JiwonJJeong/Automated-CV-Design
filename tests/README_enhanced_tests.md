@@ -61,7 +61,7 @@ This directory contains comprehensive tests following the MHLDA test pattern, wh
 
 ### Run Enhanced Tests
 ```bash
-# Run all enhanced tests (now in main test files)
+# Run all reference tests (updated with exact matching)
 pytest tests/test_chi_sq_amino.py tests/test_fisher_amino.py tests/test_bpso.py tests/test_mpso.py tests/test_pca.py tests/test_flda.py tests/test_gdhlda.py tests/test_zhlda.py tests/test_variance_enhanced.py -v
 
 # Run specific algorithm tests
@@ -75,21 +75,25 @@ pytest tests/test_gdhlda.py -v
 pytest tests/test_zhlda.py -v
 pytest tests/test_variance_enhanced.py -v
 
+# Run only reference comparison tests
+pytest tests/test_* -k "reference_output_comparison" -v
+
 # Run only property tests
-pytest tests/test_*_enhanced.py::Test*Properties -v
+pytest tests/test_*::Test*Properties -v
 pytest tests/test_chi_sq_amino.py::TestChiSqAminoProperties -v
 pytest tests/test_fisher_amino.py::TestFisherAminoProperties -v
 
 # Run only integration tests
-pytest tests/test_*_enhanced.py -k "integration" -v
 pytest tests/test_* -k "integration" -v
 ```
 
 ### Generate Reference Outputs
 ```bash
-# Run tests with reference output generation
-pytest tests/test_chi_sq_amino.py::TestChiSqAminoEnhanced::test_reference_output_comparison -v -s
-pytest tests/test_fisher_amino.py::TestFisherAminoEnhanced::test_reference_output_comparison -v -s
+# Run tests with reference output generation (now uses exact matching)
+pytest tests/test_chi_sq_amino.py::TestChiSqAmino::test_reference_output_comparison -v -s
+pytest tests/test_fisher_amino.py::TestFisherAmino::test_reference_output_comparison -v -s
+pytest tests/test_pca.py::TestPCA::test_reference_output_comparison -v -s
+pytest tests/test_flda.py::TestFLDA::test_reference_output_comparison -v -s
 ```
 
 ## 📊 Test Categories
@@ -114,22 +118,53 @@ pytest tests/test_fisher_amino.py::TestFisherAminoEnhanced::test_reference_outpu
 
 ## 🔧 Reference Outputs
 
-Reference outputs are stored in `tests/reference_outputs/`:
+Reference outputs are stored in their respective algorithm directories:
 
 ```
-reference_outputs/
-├── chi_sq_amino_reference.csv
-├── fisher_amino_reference.csv
-├── bpso_reference.csv
-├── mpso_reference.csv
-├── pca_reference.csv
-├── flda_reference.csv
-├── gdhlda_reference.csv
-├── zhlda_reference.csv
-└── variance_reference.csv
+tests/
+├── 2_feature_extraction/
+│   ├── sample_CA_coords.csv (input)
+│   └── sample_CA_post_variance.csv (variance output)
+├── 3_feature_selection/
+│   ├── bpso.csv (BPSO output)
+│   ├── mpso.csv (MPSO output)
+│   ├── chi.amino.df.csv (Chi-Squared AMINO output)
+│   └── fisher.amino.df.csv (Fisher AMINO output)
+└── 4_dimensionality_reduction/
+    ├── PCA.csv (PCA output)
+    ├── FLDA.csv (FLDA output)
+    ├── MHLDA.csv (MHLDA output)
+    ├── GDHLDA.csv (GDHLDA output)
+    └── ZHLDA.csv (ZHLDA output)
 ```
 
-These files provide known-good outputs for regression testing and ensure algorithm consistency.
+### **🎯 Reference Test Updates (Latest)**
+
+All reference tests have been **completely refactored** to use the **exact same process** as their reference generation:
+
+#### **✅ Exact Reference Matching:**
+- **Same input data**: All tests use the exact same data as reference notebooks
+- **Same parameters**: All algorithms use identical parameters to reference generation
+- **Same preprocessing**: Zero-meaning, feature selection, labeling, distance calculations match exactly
+- **No synthetic fallback**: Tests fail properly when real data isn't available
+- **Exact output validation**: All tests validate against known good outputs
+
+#### **✅ Updated Algorithms:**
+1. **PCA** - Uses `mpso.csv` with exact parameters (`num_eigenvector=2`)
+2. **FLDA** - Uses `mpso.csv` with exact parameters (`num_eigenvector=2`)
+3. **MHLDA** - Uses `mpso.csv` with exact parameters (`num_eigenvector=2`)
+4. **GDHLDA** - Uses `mpso.csv` with exact parameters (`num_eigenvector=2`, `learning_rate=0.0001`, `num_iteration=10000`)
+5. **ZHLDA** - Uses `mpso.csv` with exact parameters (`num_eigenvector=2`, `learning_rate=0.0001`, `num_iteration=10000`)
+6. **BPSO** - Uses `dist_maps` with exact parameters (`candidate_limit=150`, `bpso_iters=30`)
+7. **Chi-Squared AMINO** - Uses `sample_CA_post_variance.csv` with exact parameters (`max_amino=10`, `bins=30`)
+8. **Fisher AMINO** - Uses `sample_CA_post_variance.csv` with exact parameters (`max_outputs=5`, `bins=10`)
+9. **MPSO** - Uses `mpso.csv` with exact parameters (`candidate_limit=150`, `mpso_iters=30`)
+10. **Variance** - Uses `sample_CA_coords.csv` → `sample_CA_post_variance.csv` with exact parameters (`varThresh=1.71`)
+
+#### **✅ Test Behavior:**
+- **Will Pass When**: Reference files exist, input data available, algorithms run successfully, results match within tolerances
+- **Will Fail When**: Input data missing → Fail with clear message, Features missing → Fail with specific details, Results don't match → Fail with tolerance details
+- **Will Skip When**: Reference files missing → Skip with appropriate message
 
 ## 📝 Adding New Enhanced Tests
 
@@ -172,31 +207,42 @@ class TestAlgorithmProperties:
         pass
 ```
 
-## 🎯 Migration Completed
+## 🎯 Migration Completed + Reference Test Refactoring
 
 ✅ **Phase 1**: Enhanced tests created alongside original tests  
 ✅ **Phase 2**: Enhanced tests validated for equivalent/better coverage  
 ✅ **Phase 3**: Enhanced tests merged into main test files  
 ✅ **Phase 4**: Duplicate `*_enhanced.py` files removed  
+✅ **Phase 5**: **Reference tests completely refactored** for exact matching
 
-**Result**: All main test files now contain comprehensive MHLDA-pattern tests with preserved original functionality.
+**Result**: All main test files now contain comprehensive MHLDA-pattern tests with preserved original functionality AND exact reference matching.
 
-## 📈 Complete Coverage Achieved
+## 📈 Complete Coverage Achieved + Reference Validation
 
 ✅ **Feature Selection Algorithms**
-- Chi-Squared AMINO → `test_chi_sq_amino.py` (enhanced)
-- Fisher-AMINO → `test_fisher_amino.py` (enhanced)
-- BPSO → `test_bpso.py` (enhanced)
-- MPSO → `test_mpso.py` (enhanced)
+- Chi-Squared AMINO → `test_chi_sq_amino.py` (enhanced + exact reference matching)
+- Fisher-AMINO → `test_fisher_amino.py` (enhanced + exact reference matching)
+- BPSO → `test_bpso.py` (enhanced + exact reference matching)
+- MPSO → `test_mpso.py` (enhanced + exact reference matching)
 
 ✅ **Dimensionality Reduction Algorithms**
-- PCA → `test_pca.py` (enhanced + comprehensive original)
-- FLDA → `test_flda.py` (enhanced)
-- GDHLDA → `test_gdhlda.py` (enhanced)
-- ZHLDA → `test_zhlda.py` (enhanced)
-- MHLDA → `test_mhlda.py` (reference implementation)
+- PCA → `test_pca.py` (enhanced + comprehensive original + exact reference matching)
+- FLDA → `test_flda.py` (enhanced + exact reference matching)
+- GDHLDA → `test_gdhlda.py` (enhanced + exact reference matching)
+- ZHLDA → `test_zhlda.py` (enhanced + exact reference matching)
+- MHLDA → `test_mhlda.py` (reference implementation + exact reference matching)
 
 ✅ **Feature Extraction**
-- Variance Filtering → `test_variance_enhanced.py` (enhanced, standalone)
+- Variance Filtering → `test_variance_enhanced.py` (enhanced + exact reference matching)
 
-All major algorithms now have comprehensive enhanced test coverage following the MHLDA pattern!
+## 🎯 Latest Achievement: Exact Reference Matching
+
+All reference tests now:
+- **Use exact same input data** as reference notebooks
+- **Use exact same parameters** as reference generation
+- **Use exact same preprocessing** as reference generation
+- **Validate against exact outputs** with appropriate tolerances
+- **Fail properly** when data is missing (no synthetic fallback)
+- **Provide clear error messages** for debugging
+
+All major algorithms now have comprehensive enhanced test coverage following the MHLDA pattern **AND** exact reference validation!

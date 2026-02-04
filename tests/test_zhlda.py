@@ -388,83 +388,90 @@ class TestZHLDAEnhanced:
     # --- Reference and Reproducibility Tests ---
     
     def test_reference_output_comparison(self):
-        """Test against reference output if available."""
+        """Test against reference output using exact same process as reference notebook."""
         ref_file = os.path.join(os.path.dirname(__file__), '4_dimensionality_reduction', 'ZHLDA.csv')
         
         if not os.path.exists(ref_file):
             pytest.skip("Reference file not available")
         
         try:
-            # Create test data matching reference
-            np.random.seed(42)
-            test_df = pd.DataFrame({
-                'feature_1': np.random.normal(0, 1, 50),
-                'feature_2': np.random.normal(1, 1, 50),
-                'class': [0, 1] * 25
-            })
-            
-            result_iter = zhlda_mod.run_zhlda(test_df, num_eigenvector=1, target_col='class')
-            result_df = next(result_iter)
-            
+            # Load reference data to understand expected structure
             ref_df = pd.read_csv(ref_file)
+            expected_rows = len(ref_df)
+            expected_cols = len(ref_df.columns)
             
-            # For synthetic test, just check that the algorithm works correctly
-            # Don't compare against real data reference since they have different sizes
-            assert isinstance(result_df, pd.DataFrame)
-            assert 'class' in result_df.columns
-            assert 'LD1' in result_df.columns
-            assert len(result_df) == 50  # Should match our synthetic data size
+            # Use exact same process as reference notebook
+            # STEP 1: Load input data (same as notebook)
+            input_file = os.path.join(os.path.dirname(__file__), '3_feature_selection', 'mpso.csv')
+            if not os.path.exists(input_file):
+                pytest.fail("❌ Input data file (mpso.csv) not found. ZHLDA reference test requires the same input data as reference notebook.")
             
-            # Check that LD values have reasonable variance (not all zeros)
-            assert result_df['LD1'].var() > 1e-6, "LD1 should have variance"
+            df = pd.read_csv(input_file)
             
-        except FileNotFoundError:
-            pytest.skip("Reference file not available")
-        except Exception as e:
-            # Don't skip - let the test fail so we can see the actual error
-            raise AssertionError(f"Synthetic test failed: {e}") from e
-
-    def test_reference_output_comparison_original(self):
-        """Test against reference output if available (original style)."""
-        if not os.path.exists(REF_FILE):
-            pytest.skip("Reference file not available")
-        
-        if utils is None:
-            pytest.skip("dimensionality_reduction_utils not available")
-        
-        try:
-            df = utils.get_mpso_data()
-            df = utils.assign_classes(df, start_label=1)
+            # STEP 2: Use exact same descriptor list as notebook
+            descriptor_list = ['res159.439', 'res245.369', 'res64.137', 'res199.471', 'res78.450', 'res242.340', 'res77.293']
             
-            result_iter = zhlda_mod.run_zhlda(df, num_eigenvector=2, target_col='class')
+            # Check that all required features are available
+            missing_features = [f for f in descriptor_list if f not in df.columns]
+            if missing_features:
+                pytest.fail(f"❌ Missing required features in input data: {missing_features}")
+            
+            print(f"✅ Using input data with {len(df)} rows and all {len(descriptor_list)} required features")
+            
+            # STEP 3: Zero-mean the data (exact same process as notebook)
+            for elem in descriptor_list:
+                df[elem] = df[elem] - df[elem].mean()
+            
+            # STEP 4: Generate labels (exact same process as notebook)
+            nDataPoints = 754  # Same as notebook
+            y = np.concatenate([np.zeros(nDataPoints)+1, np.ones(nDataPoints)+1, np.ones(nDataPoints)+2])  # ZHLDA uses 1, 2, 3 labels
+            df['class'] = y
+            
+            # STEP 5: Run ZHLDA with exact same parameters as notebook
+            print("🔄 Running ZHLDA with exact reference parameters (num_eigenvector=2, learning_rate=0.0001, num_iteration=10000)...")
+            result_iter = zhlda_mod.run_zhlda(
+                df, 
+                num_eigenvector=2, 
+                target_col='class',
+                learning_rate=0.0001,  # Same as notebook
+                num_iteration=10000,   # Same as notebook
+                stop_crit=500,         # Same as notebook
+                random_state=42        # For reproducibility
+            )
             result_df = next(result_iter)
             
-            ref_df = pd.read_csv(REF_FILE)
-            
-            # Check shape
-            assert result_df.shape == ref_df.shape, f"Shape mismatch: {result_df.shape} vs {ref_df.shape}"
+            # Check that we got reasonable results
+            assert isinstance(result_df, pd.DataFrame), "Result should be a DataFrame"
+            assert 'class' in result_df.columns, "Result should contain class column"
+            assert len(result_df) == expected_rows, f"Expected {expected_rows} rows, got {len(result_df)}"
+            assert len(result_df.columns) == expected_cols, f"Expected {expected_cols} columns, got {len(result_df.columns)}"
             
             # Check class column exactly (allowing for dtype differences)
             pd.testing.assert_series_equal(
-                result_df['class'], 
-                ref_df['class'], 
-                check_dtype=False,  # Allow dtype differences
+                result_df['class'].reset_index(drop=True), 
+                ref_df['class'].reset_index(drop=True),
+                check_dtype=False,
                 check_names=False
             )
             
-            # Check LD values (with sign handling)
+            # Check LD values (with sign handling - eigenvectors can flip 180 degrees)
             for col in ['LD1', 'LD2']:
-                if col in result_df.columns:
+                if col in result_df.columns and col in ref_df.columns:
                     diff_pos = np.abs(result_df[col] - ref_df[col]).mean()
                     diff_neg = np.abs(result_df[col] + ref_df[col]).mean()
                     
-                    assert min(diff_pos, diff_neg) < 1e-3, f"Values in {col} do not match reference"
-                
+                    # Use the same tolerance as the original test (accounting for gradient descent variability)
+                    assert min(diff_pos, diff_neg) < 1e-3, f"Values in {col} do not match reference (pos_diff: {diff_pos}, neg_diff: {diff_neg})"
+            
+            print(f"✅ ZHLDA results match reference within tolerance")
+            print(f"   Shape: {result_df.shape}")
+            print(f"   Columns: {list(result_df.columns)}")
+            
         except FileNotFoundError:
-            pytest.skip("Real test data not available")
+            pytest.skip("Reference file not available")
         except Exception as e:
             # Don't skip - let the test fail so we can see the actual error
-            raise AssertionError(f"Reference comparison failed: {e}") from e
+            raise AssertionError(f"ZHLDA reference comparison failed: {e}") from e
     
     def test_reproducibility(self, sample_dataframe):
         """Test that ZHLDA produces reproducible results."""

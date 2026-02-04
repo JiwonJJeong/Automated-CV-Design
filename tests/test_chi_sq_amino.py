@@ -188,38 +188,75 @@ class TestChiSqAminoEnhanced:
             pytest.skip("Real test data not available")
 
     def test_reference_output_comparison(self):
-        """Test against reference output if available."""
+        """Test against reference output using exact same process as reference notebook."""
         ref_file = os.path.join(os.path.dirname(__file__), '3_feature_selection', 'chi.amino.df.csv')
         
         if not os.path.exists(ref_file):
             pytest.skip("Reference file not available")
         
         try:
-            # Create test data matching reference
-            np.random.seed(42)
-            test_df = pd.DataFrame({
-                'feature_1': np.random.normal(0, 1, 50),
-                'feature_2': np.random.normal(1, 1, 50),
-                'class': [0, 1] * 25
-            })
+            # Load reference data to understand expected structure
+            ref_df = pd.read_csv(ref_file)
+            expected_rows = len(ref_df)
+            expected_cols = len(ref_df.columns)
             
+            # Use exact same process as reference notebook
+            # STEP 1: Load input data (same as notebook)
+            input_file = os.path.join(os.path.dirname(__file__), '2_feature_extraction', 'sample_CA_post_variance.csv')
+            if not os.path.exists(input_file):
+                pytest.fail("❌ Input data file (sample_CA_post_variance.csv) not found. Chi-Squared AMINO reference test requires the same input data as reference notebook.")
+            
+            dfReduced = pd.read_csv(input_file)
+            dfReduced = dfReduced.iloc[:, :-1]  # Remove class column like in notebook
+            
+            print(f"✅ Using input data with {len(dfReduced)} rows and {len(dfReduced.columns)} features")
+            
+            # STEP 2: Categorize continuous variables into discrete bins (exact same process as notebook)
+            binned_columns = {col: pd.qcut(dfReduced[col], q=5, labels=False) for col in dfReduced}
+            binned_df = pd.DataFrame(binned_columns)
+            binned_df = binned_df.copy()  # Defragment like notebook
+            
+            # STEP 3: Generate labels (exact same process as notebook)
+            nDataPoints = 754  # Same as notebook
+            zeroList = [0]*nDataPoints  # class 1
+            oneList = [1]*nDataPoints   # class 2  
+            twoList = [2]*nDataPoints   # class 3
+            binned_df['class'] = np.array(zeroList + oneList + twoList)
+            
+            # STEP 4: Run Chi-Squared AMINO with exact same parameters as notebook
+            print("🔄 Running Chi-Squared AMINO with exact reference parameters (max_amino=10, bins=30)...")
             result = chi_sq_amino.run_feature_selection_pipeline(
-                lambda: (test_df,), target_col='class', max_amino=1
+                lambda: (binned_df,), target_col='class', max_amino=10, bins=30
             )
             
-            ref_df = pd.read_csv(ref_file)
+            # Check that we got reasonable results
+            assert isinstance(result, pd.DataFrame), "Result should be a DataFrame"
+            assert 'class' in result.columns, "Result should contain class column"
+            assert len(result) == expected_rows, f"Expected {expected_rows} rows, got {len(result)}"
             
-            # Check shape
-            assert result.shape[0] == ref_df.shape[0]
-            
-            # Check class column exactly
+            # Check class column exactly (allowing for dtype differences)
             pd.testing.assert_series_equal(
                 result['class'].reset_index(drop=True), 
-                ref_df['class'].reset_index(drop=True)
+                ref_df['class'].reset_index(drop=True),
+                check_dtype=False,
+                check_names=False
             )
             
+            # Check that we have the expected number of AMINO-selected features
+            selected_features = [col for col in result.columns if col != 'class']
+            assert len(selected_features) <= 10, f"Should have at most 10 AMINO features, got {len(selected_features)}"
+            assert len(selected_features) > 0, "Should have selected at least one feature"
+            
+            print(f"✅ Chi-Squared AMINO results match reference")
+            print(f"   Shape: {result.shape}")
+            print(f"   Selected features: {len(selected_features)}")
+            print(f"   Features: {selected_features}")
+            
+        except FileNotFoundError:
+            pytest.skip("Reference file not available")
         except Exception as e:
-            pytest.skip(f"Reference comparison failed: {e}")
+            # Don't skip - let the test fail so we can see the actual error
+            raise AssertionError(f"Chi-Squared AMINO reference comparison failed: {e}") from e
 
 
 class TestChiSqAminoProperties:

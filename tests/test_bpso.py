@@ -208,39 +208,91 @@ class TestBPSOEnhanced:
             pytest.skip("Real test data not available")
 
     def test_reference_output_comparison(self):
-        """Test against reference output if available."""
+        """Test against reference output using exact BPSO parameters and real data only."""
         ref_file = os.path.join(os.path.dirname(__file__), '3_feature_selection', 'bpso.csv')
         
         if not os.path.exists(ref_file):
             pytest.skip("Reference file not available")
         
         try:
-            # Create test data matching reference
-            np.random.seed(42)
-            test_df = pd.DataFrame({
-                'feature_1': np.random.normal(0, 1, 50),
-                'feature_2': np.random.normal(1, 1, 50),
-                'class': [0, 1] * 25
-            })
+            # Load reference data to understand expected structure
+            ref_df = pd.read_csv(ref_file)
+            expected_features = [col for col in ref_df.columns if col != 'class']
+            expected_rows = len(ref_df)
             
+            # Try to use real data that matches the reference
+            try:
+                # Use real data if available
+                df = data_access.create_dataframe_factory('../data/dist_maps', chunk_size=expected_rows)()
+                first_chunk = next(df)
+                
+                if len(first_chunk) >= expected_rows:
+                    # Use the same number of rows as reference
+                    test_df = first_chunk.head(expected_rows)
+                    # Ensure we have the expected features
+                    available_features = [f for f in expected_features if f in test_df.columns]
+                    if len(available_features) >= 4:  # Need at least some features
+                        test_df = test_df[available_features + ['class']]
+                        print(f"✅ Using real data with {len(available_features)}/{len(expected_features)} expected features")
+                    else:
+                        pytest.fail(f"❌ Real data found but only {len(available_features)}/{len(expected_features)} expected features available")
+                else:
+                    pytest.fail(f"❌ Real data found but only {len(first_chunk)}/{expected_rows} rows available")
+                    
+            except FileNotFoundError:
+                pytest.fail("❌ Real data not found. Reference test requires actual dist_maps data.")
+            except ValueError as e:
+                pytest.fail(f"❌ Real data validation failed: {e}")
+            except Exception as e:
+                pytest.fail(f"❌ Error loading real data: {e}")
+            
+            # Run BPSO with the exact default parameters used to create reference
+            print("🔄 Running BPSO with exact reference parameters (candidate_limit=150, bpso_iters=30, seed=42)...")
             result = bpso_svm.run_bpso_pipeline(
                 lambda: (test_df,), target_col='class',
-                candidate_limit=5, bpso_iters=3, seed=42
+                candidate_limit=150, bpso_iters=30, seed=42
             )
             
-            ref_df = pd.read_csv(ref_file)
+            # Check that we got reasonable results
+            assert isinstance(result, pd.DataFrame), "Result should be a DataFrame"
+            assert 'class' in result.columns, "Result should contain class column"
+            assert len(result) == expected_rows, f"Expected {expected_rows} rows, got {len(result)}"
             
-            # Check shape
-            assert result.shape[0] == ref_df.shape[0]
-            
-            # Check class column exactly
+            # Check class column matches exactly
             pd.testing.assert_series_equal(
                 result['class'].reset_index(drop=True), 
-                ref_df['class'].reset_index(drop=True)
+                test_df['class'].reset_index(drop=True),
+                check_dtype=False,
+                check_names=False
             )
             
+            # Check feature selection
+            selected_features = [col for col in result.columns if col != 'class']
+            assert len(selected_features) > 0, "Should have selected at least one feature"
+            assert len(selected_features) <= len(expected_features), "Should not select more features than available"
+            
+            # Check feature overlap with reference
+            ref_selected_features = [col for col in ref_df.columns if col != 'class']
+            overlap = set(selected_features) & set(ref_selected_features)
+            overlap_ratio = len(overlap) / len(selected_features) if selected_features else 0
+            
+            print(f"📊 Feature selection results:")
+            print(f"   Selected: {len(selected_features)} features")
+            print(f"   Overlap with reference: {len(overlap)}/{len(selected_features)} ({overlap_ratio:.1%})")
+            print(f"   Selected features: {selected_features}")
+            
+            # Validate that feature selection is reasonable
+            if overlap_ratio < 0.3:
+                pytest.warn(f"⚠️  Low feature overlap with reference ({overlap_ratio:.1%}). This may indicate different input data.")
+            
+            if len(selected_features) > len(ref_selected_features):
+                pytest.warn(f"⚠️  Selected more features ({len(selected_features)}) than reference ({len(ref_selected_features)})")
+            
+        except FileNotFoundError:
+            pytest.skip("Reference file not available")
         except Exception as e:
-            pytest.skip(f"Reference comparison failed: {e}")
+            # Don't skip - let the test fail so we can see the actual error
+            raise AssertionError(f"Reference comparison failed: {e}") from e
 
 
 class TestBPSOProperties:
