@@ -54,17 +54,141 @@ def compute_streaming_variance(df_iterator):
     return pd.Series(variance, index=feature_cols)
 
 def get_knee_point(variance_series):
-    """Finds the elbow/knee in the variance distribution."""
+    """Finds the elbow/knee in the variance distribution with outlier handling."""
     y = sorted(variance_series.values, reverse=True)
     x = range(len(y))
     
-    kn = KneeLocator(x, y, curve='convex', direction='decreasing')
-    if kn.knee is not None:
-        threshold = y[kn.knee]
-        return threshold
-    return 0.0
+    # Debug information
+    print(f"Variance statistics:")
+    print(f"  Max variance: {max(y):.6f}")
+    print(f"  Min variance: {min(y):.6f}")
+    print(f"  Mean variance: {np.mean(y):.6f}")
+    print(f"  Median variance: {np.median(y):.6f}")
+    print(f"  Total features: {len(y)}")
+    
+    # Detect outliers using IQR method
+    q75, q25 = np.percentile(y, [75, 25])
+    iqr = q75 - q25
+    outlier_threshold = q75 + 3 * iqr  # Very conservative outlier detection
+    
+    outliers = [v for v in y if v > outlier_threshold]
+    if outliers:
+        print(f"  ⚠️  Detected {len(outliers)} outlier variances > {outlier_threshold:.6f}")
+        print(f"  Top 5 outlier values: {outliers[:5]}")
+        
+        # Remove outliers for knee detection
+        clean_values = [v for v in y if v <= outlier_threshold]
+        if len(clean_values) < len(y) * 0.5:  # If more than half are outliers, use all data
+            print("  Too many outliers detected, using original data")
+            clean_values = y
+    else:
+        clean_values = y
+    
+    print(f"  Using {len(clean_values)} values for knee detection")
+    
+    # Try knee detection on cleaned data
+    if len(clean_values) > 1:
+        clean_x = range(len(clean_values))
+        try:
+            kn = KneeLocator(clean_x, clean_values, curve='convex', direction='decreasing', S=1.0)
+            if kn.knee is not None:
+                threshold = clean_values[kn.knee]
+                print(f"  Knee detected at index {kn.knee} with threshold {threshold:.6f}")
+                print(f"  Features above threshold: {sum(1 for v in y if v > threshold)}")
+                return threshold
+        except (ValueError, RuntimeWarning) as e:
+            print(f"  Knee detection failed: {e}")
+    
+    # Fallback strategies
+    print("  No reliable knee point detected, using fallback strategies...")
+    
+    # Strategy 1: Use 90th percentile (more aggressive)
+    if len(clean_values) > 10:
+        threshold = np.percentile(clean_values, 90)
+        print(f"  Using 90th percentile: {threshold:.6f}")
+    else:
+        # Strategy 2: Use median-based threshold
+        median_threshold = np.median(y) * 2
+        threshold = median_threshold
+        print(f"  Using 2x median: {threshold:.6f}")
+    
+    print(f"  Features above threshold: {sum(1 for v in y if v > threshold)}")
+    return threshold
 
-def variance_filter_pipeline(df_iterator, return_threshold=False):
+def plot_variance_distribution(variance_series, threshold=None):
+    """
+    Plot the variance distribution with knee point.
+    
+    Args:
+        variance_series (pd.Series): Variance values for features
+        threshold (float): Threshold value to highlight
+    """
+    plt.figure(figsize=(12, 8))
+    
+    # Sort variance values in descending order
+    sorted_variance = sorted(variance_series.values, reverse=True)
+    x = range(len(sorted_variance))
+    
+    # Create subplots for both linear and log scale
+    plt.subplot(2, 1, 1)
+    plt.plot(x, sorted_variance, 'b-', linewidth=2, label='Feature Variance')
+    plt.xlabel('Feature Rank (sorted by variance)')
+    plt.ylabel('Variance Value')
+    plt.title('Feature Variance Distribution (Linear Scale)')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    if threshold is not None:
+        threshold_idx = next((i for i, v in enumerate(sorted_variance) if v <= threshold), len(sorted_variance)-1)
+        plt.axhline(y=threshold, color='r', linestyle='--', label=f'Threshold: {threshold:.3f}')
+        plt.axvline(x=threshold_idx, color='r', linestyle=':', alpha=0.7)
+        plt.scatter([threshold_idx], [threshold], color='red', s=100, zorder=5)
+    
+    # Log scale subplot
+    plt.subplot(2, 1, 2)
+    # Filter out zero values for log scale
+    non_zero_variance = [v for v in sorted_variance if v > 0]
+    non_zero_x = range(len(non_zero_variance))
+    
+    plt.semilogy(non_zero_x, non_zero_variance, 'g-', linewidth=2, label='Feature Variance (log scale)')
+    plt.xlabel('Feature Rank (sorted by variance)')
+    plt.ylabel('Variance Value (log scale)')
+    plt.title('Feature Variance Distribution (Log Scale)')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    if threshold is not None and threshold > 0:
+        threshold_idx_log = next((i for i, v in enumerate(non_zero_variance) if v <= threshold), len(non_zero_variance)-1)
+        plt.axhline(y=threshold, color='r', linestyle='--', label=f'Threshold: {threshold:.3f}')
+        plt.axvline(x=threshold_idx_log, color='r', linestyle=':', alpha=0.7)
+        plt.scatter([threshold_idx_log], [threshold], color='red', s=100, zorder=5)
+    
+    plt.tight_layout()
+    
+    plt.show(block=False)
+    plt.pause(3.0)  # Keep visible for 3 seconds
+    # Don't close here - let it stay visible during computation
+
+def identify_problematic_features(variance_series, outlier_threshold=None):
+    """Identify features with suspiciously high variance."""
+    if outlier_threshold is None:
+        q75, q25 = np.percentile(variance_series.values, [75, 25])
+        iqr = q75 - q25
+        outlier_threshold = q75 + 3 * iqr
+    
+    outliers = variance_series[variance_series > outlier_threshold]
+    
+    if len(outliers) > 0:
+        print(f"\n🔍 Problematic Features (variance > {outlier_threshold:.6f}):")
+        for feature, variance in outliers.head(10).items():
+            print(f"  {feature}: {variance:.6f}")
+        
+        if len(outliers) > 10:
+            print(f"  ... and {len(outliers) - 10} more")
+    
+    return outliers
+
+def variance_filter_pipeline(df_iterator, return_threshold=False, show_plot=False):
     """
     Two-pass memory-efficient variance filtering pipeline.
     Pass 1: Calculate variance from iterator
@@ -84,16 +208,53 @@ def variance_filter_pipeline(df_iterator, return_threshold=False):
     # Note: This stores DataFrames in memory, but they're already chunked
     df_chunks = list(df_iterator)
     
+    if not df_chunks:
+        print("Warning: No data chunks found")
+        return
+    
+    # Check if all chunks have the same columns
+    first_cols = set(df_chunks[0].columns)
+    for i, chunk in enumerate(df_chunks):
+        if set(chunk.columns) != first_cols:
+            print(f"Warning: Chunk {i} has different columns. Skipping variance filtering.")
+            # Just yield the original chunks without filtering
+            for chunk in df_chunks:
+                yield chunk
+            return
+    
     variance_series = compute_streaming_variance(iter(df_chunks))
     
     if len(variance_series) == 0:
         print("Warning: No features found for variance calculation")
+        # Just yield the original chunks without filtering
+        for chunk in df_chunks:
+            yield chunk
         return
     
     threshold = get_knee_point(variance_series)
     selected_features = variance_series[variance_series > threshold].index.tolist()
     
-    print(f"Threshold: {threshold:.6f} | Retained: {len(selected_features)} features.")
+    # Identify and report problematic features
+    outliers = identify_problematic_features(variance_series)
+    
+    # Ensure we keep at least some features (minimum 5% or 50 features, whichever is smaller)
+    min_features = max(5, min(50, int(len(variance_series) * 0.05)))
+    
+    if len(selected_features) < min_features:
+        print(f"\nWarning: Only {len(selected_features)} features above threshold.")
+        print(f"Adjusting threshold to keep at least {min_features} features...")
+        
+        # Use percentile to ensure minimum features
+        adjusted_threshold = np.percentile(variance_series, (1 - min_features/len(variance_series)) * 100)
+        selected_features = variance_series[variance_series >= adjusted_threshold].index.tolist()
+        threshold = adjusted_threshold
+        print(f"New threshold: {threshold:.6f} | Retained: {len(selected_features)} features.")
+    else:
+        print(f"\nThreshold: {threshold:.6f} | Retained: {len(selected_features)} features.")
+    
+    # Plot variance distribution if requested
+    if show_plot:
+        plot_variance_distribution(variance_series, threshold)
 
     # PASS 2: Yield filtered data
     for chunk in df_chunks:

@@ -1,4 +1,23 @@
-import amino_fast_mod as amino
+import sys
+import os
+
+# Try to import amino_fast_mod with proper path handling
+try:
+    # Add current directory to Python path
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    if current_dir not in sys.path:
+        sys.path.append(current_dir)
+    
+    import amino_fast_mod as amino
+except ImportError as e:
+    print(f"Warning: Could not import amino_fast_mod: {e}")
+    print("Falling back to basic amino module")
+    try:
+        import amino as amino
+    except ImportError:
+        print("Error: No amino module available")
+        amino = None
+
 import numpy as np
 import pandas as pd
 import gc
@@ -19,12 +38,17 @@ def compute_sequential_fisher(df_iterator_factory, target_col):
     global_sum = {}
     global_sum_sq = {}
     total_count = 0
+    classes_found = set()
 
     # Pass 1: Accumulate Statistics
     for chunk in df_iterator_factory():
         feature_cols = [c for c in get_feature_cols(chunk) if c != target_col]
         y = chunk[target_col].astype(int).values
         current_chunk_classes = np.unique(y)
+        classes_found.update(current_chunk_classes)
+        
+        if total_count == 0:
+            print(f"Found classes in data: {sorted(current_chunk_classes)}")
 
         for col in feature_cols:
             # 1. Ensure the feature exists in stats
@@ -76,7 +100,10 @@ def compute_sequential_fisher(df_iterator_factory, target_col):
             
         fisher_scores[col] = numerator / (denominator + 1e-12)
 
-    return pd.Series(fisher_scores).sort_values(ascending=False)
+    result = pd.Series(fisher_scores).sort_values(ascending=False)
+    print(f"Fisher computation complete. Non-zero scores: {(result > 0).sum()}/{len(result)}")
+    print(f"Max Fisher score: {result.max():.6f}")
+    return result
 
 def extract_candidates_only(df_iterator, target_col, candidates):
     """
@@ -101,25 +128,39 @@ def run_fisher_amino_pipeline(df_iterator_factory, target_col='class', max_outpu
     
     # 2. Knee Detection
     y_vals = fisher_s.values
-    kn = KneeLocator(range(1, len(y_vals) + 1), y_vals, curve='convex', direction='decreasing', S=1.0)
-    threshold = kn.knee_y if kn.knee_y is not None else 0.0
+    try:
+        kn = KneeLocator(range(1, len(y_vals) + 1), y_vals, curve='convex', direction='decreasing', S=1.0)
+        if kn.knee_y is not None:
+            threshold = kn.knee_y
+        else:
+            print("Fisher knee detection: No knee point found")
+            threshold = np.percentile(y_vals, 90)  # Fallback to 90th percentile
+    except (ValueError, RuntimeWarning) as e:
+        print(f"Fisher knee detection failed: {e}")
+        threshold = np.percentile(y_vals, 90)  # Fallback to 90th percentile
+    
     candidate_features = fisher_s[fisher_s >= threshold].index.tolist()
     
     print(f"Fisher Knee: {threshold:.4f} | Candidates: {len(candidate_features)}")
 
-    # 3. Memory Cap
-    if len(candidate_features) > 250:
-        candidate_features = fisher_s.head(250).index.tolist()
+    # 3. Memory Cap (reduced for performance)
+    if len(candidate_features) > 50:  # Reduced from 250 to 50
+        candidate_features = fisher_s.head(50).index.tolist()
+        print(f"Limited Fisher candidates to {len(candidate_features)} for AMINO performance")
 
     # 4. Extract for AMINO
     df_amino_input = extract_candidates_only(df_iterator_factory(), target_col, candidate_features)
     gc.collect()
 
     # 5. AMINO Redundancy Reduction
-    print("Running AMINO...")
-    ops = [amino.OrderParameter(name, df_amino_input[name].tolist()) for name in candidate_features]
+    if amino is None:
+        print("AMINO module not available. Returning top Fisher features without redundancy reduction.")
+        final_names = candidate_features[:max_outputs]
+        return df_amino_input[final_names + [target_col]]
     
+    print("Running AMINO...")
     try:
+        ops = [amino.OrderParameter(name, df_amino_input[name].tolist()) for name in candidate_features]
         final_ops = amino.find_ops(ops, max_outputs=max_outputs, bins=20, distortion_filename=None)
         final_names = [str(op) for op in final_ops]
     except Exception as e:
