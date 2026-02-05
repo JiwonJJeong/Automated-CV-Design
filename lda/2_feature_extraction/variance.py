@@ -53,7 +53,7 @@ def compute_streaming_variance(df_iterator):
     variance = m2_a / n_a
     return pd.Series(variance, index=feature_cols)
 
-def get_knee_point(variance_series):
+def get_knee_point(variance_series, knee_S=1.0, outlier_multiplier=3.0, fallback_percentile=90, min_clean_ratio=0.5):
     """Finds the elbow/knee in the variance distribution with outlier handling."""
     y = sorted(variance_series.values, reverse=True)
     x = range(len(y))
@@ -69,7 +69,7 @@ def get_knee_point(variance_series):
     # Detect outliers using IQR method
     q75, q25 = np.percentile(y, [75, 25])
     iqr = q75 - q25
-    outlier_threshold = q75 + 3 * iqr  # Very conservative outlier detection
+    outlier_threshold = q75 + outlier_multiplier * iqr  # Configurable outlier detection
     
     outliers = [v for v in y if v > outlier_threshold]
     if outliers:
@@ -78,7 +78,7 @@ def get_knee_point(variance_series):
         
         # Remove outliers for knee detection
         clean_values = [v for v in y if v <= outlier_threshold]
-        if len(clean_values) < len(y) * 0.5:  # If more than half are outliers, use all data
+        if len(clean_values) < len(y) * min_clean_ratio:  # Configurable clean ratio threshold
             print("  Too many outliers detected, using original data")
             clean_values = y
     else:
@@ -90,7 +90,7 @@ def get_knee_point(variance_series):
     if len(clean_values) > 1:
         clean_x = range(len(clean_values))
         try:
-            kn = KneeLocator(clean_x, clean_values, curve='convex', direction='decreasing', S=1.0)
+            kn = KneeLocator(clean_x, clean_values, curve='convex', direction='decreasing', S=knee_S)
             if kn.knee is not None:
                 threshold = clean_values[kn.knee]
                 print(f"  Knee detected at index {kn.knee} with threshold {threshold:.6f}")
@@ -102,10 +102,10 @@ def get_knee_point(variance_series):
     # Fallback strategies
     print("  No reliable knee point detected, using fallback strategies...")
     
-    # Strategy 1: Use 90th percentile (more aggressive)
+    # Strategy 1: Use configurable percentile (more aggressive)
     if len(clean_values) > 10:
-        threshold = np.percentile(clean_values, 90)
-        print(f"  Using 90th percentile: {threshold:.6f}")
+        threshold = np.percentile(clean_values, fallback_percentile)
+        print(f"  Using {fallback_percentile}th percentile: {threshold:.6f}")
     else:
         # Strategy 2: Use median-based threshold
         median_threshold = np.median(y) * 2
@@ -166,7 +166,7 @@ def plot_variance_distribution(variance_series, threshold=None):
     plt.tight_layout()
     
     plt.show(block=False)
-    plt.pause(3.0)  # Keep visible for 3 seconds
+    plt.pause(plot_pause)  # Configurable pause duration
     # Don't close here - let it stay visible during computation
 
 def identify_problematic_features(variance_series, outlier_threshold=None):
@@ -188,7 +188,7 @@ def identify_problematic_features(variance_series, outlier_threshold=None):
     
     return outliers
 
-def variance_filter_pipeline(df_iterator, return_threshold=False, show_plot=False):
+def variance_filter_pipeline(df_iterator, return_threshold=False, show_plot=False, knee_S=1.0, outlier_multiplier=3.0, fallback_percentile=90, min_clean_ratio=0.5, plot_pause=3.0):
     """
     Two-pass memory-efficient variance filtering pipeline.
     Pass 1: Calculate variance from iterator
@@ -231,7 +231,7 @@ def variance_filter_pipeline(df_iterator, return_threshold=False, show_plot=Fals
             yield chunk
         return
     
-    threshold = get_knee_point(variance_series)
+    threshold = get_knee_point(variance_series, knee_S=knee_S, outlier_multiplier=outlier_multiplier, fallback_percentile=fallback_percentile, min_clean_ratio=min_clean_ratio)
     selected_features = variance_series[variance_series > threshold].index.tolist()
     
     # Identify and report problematic features

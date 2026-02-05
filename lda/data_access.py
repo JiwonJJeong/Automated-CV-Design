@@ -37,7 +37,7 @@ def load_canonical_residues(data_dir: str = BASE_DIR) -> np.ndarray:
     Raises:
         FileNotFoundError: If canonical_resids.npy file is not found.
     """
-    # Look for canonical_resids.npy in the subdirectories
+    # Look for canonical_resids.npy files
     base_path = Path(data_dir)
     
     # Search for canonical_resids.npy files
@@ -49,7 +49,11 @@ def load_canonical_residues(data_dir: str = BASE_DIR) -> np.ndarray:
     # Use the first one found (they should be identical across subconstructs)
     canonical_resids = np.load(resids_files[0])
     
-    print(f"Loaded {len(canonical_resids)} canonical residues from {resids_files[0]}")
+    # Only print once per session
+    if not hasattr(load_canonical_residues, '_printed'):
+        print(f"Loaded {len(canonical_resids)} canonical residues from {resids_files[0]}")
+        load_canonical_residues._printed = True
+    
     return canonical_resids
 
 def get_feature_cols(df: pd.DataFrame) -> List[str]:
@@ -342,35 +346,101 @@ def save_h5_data(data: Union[pd.DataFrame, np.ndarray], h5_path: str,
 # UNIFIED DATA ITERATORS (H5 + NPY)
 # =============================================================================
 
+def _filter_files_by_construct_subconstruct(data_files: List[Dict[str, str]], 
+                                          constructs: Optional[List[str]] = None,
+                                          subconstructs: Optional[List[str]] = None) -> List[Dict[str, str]]:
+    """
+    Filter data files by construct and subconstruct criteria.
+    
+    Args:
+        data_files: List of file information dictionaries
+        constructs: List of construct names to include (None = all)
+        subconstructs: List of subconstruct names to include (None = all)
+        
+    Returns:
+        Filtered list of file information dictionaries
+    """
+    filtered_files = []
+    
+    for file_info in data_files:
+        file_path = file_info["path"]
+        filename = os.path.basename(file_path)
+        
+        # Extract construct and subconstruct from filename
+        # Expected format: construct_subconstruct_replica.ext
+        parts = filename.split('_')
+        
+        if len(parts) >= 2:
+            file_construct = parts[0]
+            file_subconstruct = parts[1]
+            
+            # Check construct filter
+            construct_match = (constructs is None) or (file_construct in constructs)
+            
+            # Check subconstruct filter  
+            subconstruct_match = (subconstructs is None) or (file_subconstruct in subconstructs)
+            
+            if construct_match and subconstruct_match:
+                filtered_files.append(file_info)
+                print(f"✅ Including: {filename} (construct: {file_construct}, subconstruct: {file_subconstruct})")
+            else:
+                print(f"🚫 Filtering: {filename} (construct: {file_construct}, subconstruct: {file_subconstruct})")
+        else:
+            print(f"⚠️  Unexpected filename format: {filename}")
+    
+    print(f"📊 Filtered {len(data_files)} files down to {len(filtered_files)} matching criteria")
+    return filtered_files
+
 def data_iterator(base_dir: str = BASE_DIR, chunk_size: int = 10000, 
-                 dataset_name: str = 'distances') -> Iterator[pd.DataFrame]:
+                 dataset_name: str = 'distances', 
+                 constructs: Optional[List[str]] = None,
+                 subconstructs: Optional[List[str]] = None) -> Iterator[pd.DataFrame]:
     """
     Unified data iterator that yields DataFrames from both H5 and NPY files.
     Automatically handles the mixed file structure and provides consistent output format.
     
     Args:
         base_dir (str): Base directory containing the data files.
-        chunk_size (int): Size of each chunk to yield.
+        chunk_size (int): Number of rows per chunk.
         dataset_name (str): Name of dataset to load from H5 files.
+        constructs (List[str], optional): Filter by specific constructs only.
+        subconstructs (List[str], optional): Filter by specific subconstructs only.
         
     Yields:
         pd.DataFrame: Data chunk with consistent column structure.
     """
     data_files = get_data_files(base_dir)
     
-    if not data_files:
-        print(f"No data files found in {base_dir}")
-        return
-
+    # Filter files by construct and subconstruct if specified
+    if constructs is not None or subconstructs is not None:
+        data_files = _filter_files_by_construct_subconstruct(data_files, constructs, subconstructs)
+        
+        if not data_files:
+            print(f"⚠️  No files found matching the specified construct/subconstruct filters:")
+            if constructs:
+                print(f"   Constructs: {constructs}")
+            if subconstructs:
+                print(f"   Subconstructs: {subconstructs}")
+            return
+    
+    # Initialize error counter
+    if not hasattr(data_iterator, '_error_count'):
+        data_iterator._error_count = 0
+    
     for file_info in data_files:
         try:
-            if file_info["type"] == 'h5':
+            if file_info["type"] == "h5":
                 yield from _iterate_h5_file(file_info, chunk_size, dataset_name)
-            elif file_info["type"] == 'npy':
+            elif file_info["type"] == "npy":
                 yield from _iterate_npy_file(file_info, chunk_size)
                     
         except Exception as e:
-            print(f"Error processing {file_info['path']}: {e}")
+            data_iterator._error_count += 1
+            # Only show first 3 error messages
+            if data_iterator._error_count <= 3:
+                print(f"Error processing {file_info['path']}: {e}")
+            elif data_iterator._error_count == 4:
+                print("... (suppressing further error messages)")
             continue
 
 def _iterate_h5_file(file_info: Dict[str, str], chunk_size: int, dataset_name: str) -> Iterator[pd.DataFrame]:
@@ -379,7 +449,10 @@ def _iterate_h5_file(file_info: Dict[str, str], chunk_size: int, dataset_name: s
         # Determine the actual dataset name
         actual_ds = _get_dataset_name(f, dataset_name)
         if actual_ds is None:
-            print(f"Warning: No valid dataset found in {file_info['path']}")
+            # Only show first warning
+            if not hasattr(_iterate_h5_file, '_warning_shown'):
+                print(f"Warning: No valid dataset found in some files")
+                _iterate_h5_file._warning_shown = True
             return
         
         dataset = f[actual_ds]
@@ -470,7 +543,17 @@ def _add_metadata_columns(df: pd.DataFrame, file_info: Dict[str, str],
     df['replica'] = file_info['replica']
     
     if times is not None:
-        df['time'] = times[start_idx:end_idx]
+        # Ensure the times slice matches the DataFrame length
+        time_slice = times[start_idx:end_idx]
+        if len(time_slice) == len(df):
+            df['time'] = time_slice
+        else:
+            # If lengths don't match, create a sequential time array
+            # Only show this warning once
+            if not hasattr(_add_metadata_columns, '_time_warning_shown'):
+                print(f"Warning: Time array length mismatch detected. Using sequential time values.")
+                _add_metadata_columns._time_warning_shown = True
+            df['time'] = np.arange(len(df))
     
     df['frame_number'] = np.arange(start_idx, end_idx) + 1
     return df
@@ -479,23 +562,74 @@ def _add_metadata_columns(df: pd.DataFrame, file_info: Dict[str, str],
 # LEGACY COMPATIBILITY FUNCTIONS
 # =============================================================================
 
-def create_dataframe_factory(base_dir: str = BASE_DIR, **kwargs):
+def list_available_constructs_subconstructs(base_dir: str = BASE_DIR) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
+    """
+    Scan data directory and return available constructs and subconstructs.
+    
+    Args:
+        base_dir: Base directory containing data files
+        
+    Returns:
+        Tuple of (constructs_dict, subconstructs_dict) where:
+        - constructs_dict: {construct: [subconstructs]}
+        - subconstructs_dict: {subconstruct: [constructs]}
+    """
+    data_files = get_data_files(base_dir)
+    
+    constructs_dict = {}
+    subconstructs_dict = {}
+    
+    for file_info in data_files:
+        file_path = file_info["path"]
+        filename = os.path.basename(file_path)
+        
+        # Extract construct and subconstruct from filename
+        parts = filename.split('_')
+        
+        if len(parts) >= 2:
+            construct = parts[0]
+            subconstruct = parts[1]
+            
+            # Build constructs dict
+            if construct not in constructs_dict:
+                constructs_dict[construct] = []
+            if subconstruct not in constructs_dict[construct]:
+                constructs_dict[construct].append(subconstruct)
+            
+            # Build subconstructs dict
+            if subconstruct not in subconstructs_dict:
+                subconstructs_dict[subconstruct] = []
+            if construct not in subconstructs_dict[subconstruct]:
+                subconstructs_dict[subconstruct].append(construct)
+    
+    # Sort the lists
+    for construct in constructs_dict:
+        constructs_dict[construct].sort()
+    for subconstruct in subconstructs_dict:
+        subconstructs_dict[subconstruct].sort()
+    
+    return constructs_dict, subconstructs_dict
+
+
+def create_dataframe_factory(base_dir: str = BASE_DIR, 
+                           constructs: Optional[List[str]] = None,
+                           subconstructs: Optional[List[str]] = None,
+                           **kwargs):
     """
     Creates a DataFrame factory compatible with existing pipeline functions.
     Returns a callable that creates a fresh iterator every time it's called.
     
-    This fixes the "Exhausted Generator" trap where generators can only be iterated once.
-    Pipelines need a callable (function that returns a generator) rather than the generator itself.
-    
     Args:
-        base_dir (str): Base directory containing the data files.
+        base_dir (str): Base directory containing data files.
+        constructs (List[str], optional): Filter by specific constructs only.
+        subconstructs (List[str], optional): Filter by specific subconstructs only.
         **kwargs: Additional arguments passed to data_iterator.
         
     Returns:
         callable: Function that returns a fresh data_iterator when called.
     """
     def factory():
-        return data_iterator(base_dir=base_dir, **kwargs)
+        return data_iterator(base_dir=base_dir, constructs=constructs, subconstructs=subconstructs, **kwargs)
     
     return factory
 
