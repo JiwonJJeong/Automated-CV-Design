@@ -14,7 +14,7 @@ from hypothesis.extra.pandas import data_frames, column, range_indexes
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 LDA_DIR = os.path.join(BASE_DIR, 'lda')
-DR_DIR = os.path.join(LDA_DIR, '4_dimensionality_reduction')
+DR_DIR = os.path.join(LDA_DIR, 'dimensionality_reduction')
 sys.path.extend([LDA_DIR, DR_DIR, os.path.join(BASE_DIR, 'tests')])
 
 # 1. Load data_access.py

@@ -14,7 +14,7 @@ from hypothesis.extra.pandas import data_frames, column, range_indexes
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 LDA_DIR = os.path.join(BASE_DIR, 'lda')
-FEATURE_DIR = os.path.join(LDA_DIR, '3_feature_selection')
+FEATURE_DIR = os.path.join(LDA_DIR, 'feature_selection')
 sys.path.extend([LDA_DIR, FEATURE_DIR])
 
 # 1. Load data_access.py

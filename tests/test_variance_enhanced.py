@@ -13,7 +13,7 @@ from hypothesis.extra.pandas import data_frames, column, range_indexes
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 LDA_DIR = os.path.join(BASE_DIR, 'lda')
-FE_DIR = os.path.join(LDA_DIR, '2_feature_extraction')
+FE_DIR = os.path.join(LDA_DIR, 'feature_extraction')
 sys.path.extend([LDA_DIR, FE_DIR])
 
 # 1. Load data_access.py

@@ -9,20 +9,21 @@ from hypothesis.extra.pandas import data_frames, column, range_indexes
 
 # Setup paths
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-sys.path.append(os.path.join(BASE_DIR, 'lda', '4_dimensionality_reduction'))
+sys.path.append(os.path.join(BASE_DIR, 'lda', 'dimensionality_reduction'))
 sys.path.append(os.path.join(BASE_DIR, 'tests'))
 
 import importlib.util
 
 # Load the module using spec_from_file_location
-module_path = os.path.join(BASE_DIR, 'lda', '4_dimensionality_reduction', 'MHLDA.py')
+LDA_DIR = os.path.join(BASE_DIR, 'lda')
+module_path = os.path.join(LDA_DIR, 'dimensionality_reduction', 'MHLDA.py')
 spec = importlib.util.spec_from_file_location("mhlda_mod", module_path)
 mhlda_mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mhlda_mod)
 import dimensionality_reduction_utils as utils
 
 # Reference files
-REF_FILE = os.path.join(BASE_DIR, "tests", "4_dimensionality_reduction", "MHLDA.csv")
+REF_FILE = os.path.join(BASE_DIR, "tests", "dimensionality_reduction", "MHLDA.csv")
 
 class TestMHLDA:
     """Comprehensive test suite for Modified Heteroscedastic LDA."""
