@@ -105,21 +105,33 @@ def compute_sequential_fisher(df_iterator_factory, target_col):
     print(f"Max Fisher score: {result.max():.6f}")
     return result
 
-def extract_candidates_only(df_iterator, target_col, candidates):
+def extract_candidates_only(df_iterator_factory, target_col, candidates):
     """
-    Pass 2: Extracts only high-signal features and essential metadata for AMINO.
+    Pass 2: Optimized extraction. 
+    Uses a generator to keep memory overhead low before concatenation.
     """
     print(f"Loading {len(candidates)} candidate features into memory...")
-    data_list = []
-    cols_to_keep = candidates + [target_col] + [c for c in ['time', 'frame_number'] if c in METADATA_COLS]
     
-    for chunk in df_iterator:
-        available = [c for c in cols_to_keep if c in chunk.columns]
-        data_list.append(chunk[available])
-        
-    return pd.concat(data_list, ignore_index=True)
+    # Define columns to keep
+    cols_to_keep = candidates + [target_col]
+    for c in ['time', 'frame_number']:
+        if c in METADATA_COLS:
+            cols_to_keep.append(c)
 
-def run_fisher_amino_pipeline(df_iterator_factory, target_col='class', max_outputs=5):
+    def chunk_generator():
+        for chunk in df_iterator_factory():
+            # Filter columns immediately to drop unneeded data from RAM
+            available = [c for c in cols_to_keep if c in chunk.columns]
+            yield chunk[available]
+
+    # Concat the generator directly
+    full_df = pd.concat(chunk_generator(), ignore_index=True)
+    
+    # Explicitly clear internal buffers
+    gc.collect()
+    return full_df
+
+def run_fisher_amino_pipeline(df_iterator_factory, target_col='class', max_outputs=5, knee_S=1.0, fallback_percentile=90, bins=20, distortion_filename=None):
     """
     Integrated Fisher-AMINO Pipeline.
     """
@@ -129,26 +141,21 @@ def run_fisher_amino_pipeline(df_iterator_factory, target_col='class', max_outpu
     # 2. Knee Detection
     y_vals = fisher_s.values
     try:
-        kn = KneeLocator(range(1, len(y_vals) + 1), y_vals, curve='convex', direction='decreasing', S=1.0)
+        kn = KneeLocator(range(1, len(y_vals) + 1), y_vals, curve='convex', direction='decreasing', S=knee_S)
         if kn.knee_y is not None:
             threshold = kn.knee_y
         else:
             print("Fisher knee detection: No knee point found")
-            threshold = np.percentile(y_vals, 90)  # Fallback to 90th percentile
+            threshold = np.percentile(y_vals, fallback_percentile)  # Fallback to percentile
     except (ValueError, RuntimeWarning) as e:
         print(f"Fisher knee detection failed: {e}")
-        threshold = np.percentile(y_vals, 90)  # Fallback to 90th percentile
+        threshold = np.percentile(y_vals, fallback_percentile)  # Fallback to percentile
     
     candidate_features = fisher_s[fisher_s >= threshold].index.tolist()
     
     print(f"Fisher Knee: {threshold:.4f} | Candidates: {len(candidate_features)}")
 
-    # 3. Memory Cap (reduced for performance)
-    if len(candidate_features) > 50:  # Reduced from 250 to 50
-        candidate_features = fisher_s.head(50).index.tolist()
-        print(f"Limited Fisher candidates to {len(candidate_features)} for AMINO performance")
-
-    # 4. Extract for AMINO
+    # 3. Extract for AMINO
     df_amino_input = extract_candidates_only(df_iterator_factory(), target_col, candidate_features)
     gc.collect()
 
@@ -160,8 +167,9 @@ def run_fisher_amino_pipeline(df_iterator_factory, target_col='class', max_outpu
     
     print("Running AMINO...")
     try:
-        ops = [amino.OrderParameter(name, df_amino_input[name].tolist()) for name in candidate_features]
-        final_ops = amino.find_ops(ops, max_outputs=max_outputs, bins=20, distortion_filename=None)
+        # Pass the numpy array buffer (.values) instead of converting to a list (.tolist())
+        ops = [amino.OrderParameter(name, df_amino_input[name].values) for name in candidate_features]
+        final_ops = amino.find_ops(ops, max_outputs=max_outputs, bins=bins, distortion_filename=distortion_filename)
         final_names = [str(op) for op in final_ops]
     except Exception as e:
         print(f"AMINO failed: {e}. Falling back to top Fisher features.")

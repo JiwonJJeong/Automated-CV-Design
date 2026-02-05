@@ -57,16 +57,19 @@ def compute_fisher_scores(df_iterator, target_col='class'):
 # --- MPSO PROBLEM DEFINITION ---
 
 class MPSOProjectionProblem(Problem):
-    def __init__(self, X_train, y_train, dims, alpha=0.9):
+    def __init__(self, X_train, y_train, dims, alpha=0.9, threshold=0.5, n_estimators=5, cv=3):
         super().__init__(dimension=X_train.shape[1] * dims, lower=0, upper=1)
         self.X_train, self.y_train = X_train, y_train
         self.dims = dims
         self.alpha = alpha
+        self.threshold = threshold
+        self.n_estimators = n_estimators
+        self.cv = cv
         self.n_feats = X_train.shape[1]
 
     def _evaluate(self, x):
         # Selection Matrix (Features x Dims)
-        sel_matrix = (x > 0.8).reshape((self.n_feats, self.dims))
+        sel_matrix = (x > self.threshold).reshape((self.n_feats, self.dims))
         
         if np.any(np.sum(sel_matrix, axis=0) == 0):
             return 1.0
@@ -74,18 +77,15 @@ class MPSOProjectionProblem(Problem):
         # Matrix Projection
         projected = np.matmul(self.X_train, sel_matrix) / np.sum(sel_matrix, axis=0)
 
-        clf = OneVsRestClassifier(BaggingClassifier(LinearSVC(dual=False, tol=1e-3), n_estimators=5))
-        try:
-            acc = cross_val_score(clf, projected, self.y_train, cv=3).mean()
-        except:
-            return 1.0
+        clf = OneVsRestClassifier(BaggingClassifier(LinearSVC(dual=False, tol=1e-3), n_estimators=self.n_estimators))
+        acc = cross_val_score(clf, projected, self.y_train, cv=self.cv).mean()
 
         sparsity = np.sum(sel_matrix) / (self.n_feats * self.dims)
         return self.alpha * (1 - acc) + (1 - self.alpha) * sparsity
 
 # --- MAIN PIPELINE ---
 
-def run_mpso_pipeline(df_iterator_factory, target_col='class', dims=5, candidate_limit=250, mpso_iters=40, seed=42):
+def run_mpso_pipeline(df_iterator_factory, target_col='class', dims=5, candidate_limit=250, mpso_iters=40, alpha=0.9, threshold=0.5, population_size=None, pop_scaling=0.02, min_pop=40, max_pop=100, n_estimators=5, cv=3, seed=42):
     """
     Integrated Pipeline accepting a callable factory.
     Synchronized with Chi-Sq and BPSO architecture.
@@ -116,16 +116,22 @@ def run_mpso_pipeline(df_iterator_factory, target_col='class', dims=5, candidate
     gc.collect()
 
     # 3. Particle Swarm Optimization
+    # Scale population for larger search space (1250 variables vs 150 in BPSO)
+    if population_size is None:
+        dynamic_pop = int(np.clip(len(candidates) * dims * pop_scaling, min_pop, max_pop))
+    else:
+        dynamic_pop = population_size
+    print(f"Running MPSO on {len(candidates)} features x {dims} dims = {len(candidates) * dims} variables (Pop: {dynamic_pop})")
     
-    problem = MPSOProjectionProblem(X, y, dims=dims)
+    problem = MPSOProjectionProblem(X, y, dims=dims, alpha=alpha, threshold=threshold, n_estimators=n_estimators, cv=cv)
     task = Task(problem, max_iters=mpso_iters)
-    algorithm = ParticleSwarmOptimization(population_size=25, seed=seed)
+    algorithm = ParticleSwarmOptimization(population_size=dynamic_pop, seed=seed)
     
     print("Beginning Swarm Optimization...")
     best_x, _ = algorithm.run(task)
     
     # 4. Final Transform
-    final_sel = (best_x > 0.8).reshape((len(candidates), dims))
+    final_sel = (best_x > threshold).reshape((len(candidates), dims))
     # Normalize projection by number of features contributing to each dimension
     projected_vals = np.matmul(X, final_sel) / (np.sum(final_sel, axis=0) + 1e-12)
     

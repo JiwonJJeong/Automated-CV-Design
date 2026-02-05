@@ -121,123 +121,108 @@ def plot_amino_results(selected_features, amino_ops=None):
 # CORE PROCESSING (SEQUENTIAL & OPTIMIZED)
 # =============================================================================
 
-def estimate_bin_edges(df_iterator, target_col, q_bins=5, sample_rows=20000):
+def estimate_bin_edges_and_classes(df_iterator, target_col, q_bins=5, sample_rows=20000):
     """
-    Pass 0: Reads a sample to estimate global quantile-based bin edges.
+    Pass 0: Estimates bin edges AND discovers all target classes.
     """
-    print(f"Sampling to estimate Chi-Squared bin edges...")
+    print(f"Sampling to estimate Chi-Squared bin edges and classes...")
     collected = 0
     sample_list = []
+    unique_classes = set() # Track classes
     
     for chunk in df_iterator:
-        # Dynamically identify feature columns using the helper
-        feature_cols = [c for c in get_feature_cols(chunk) if c != target_col]
-        needed = sample_rows - collected
-        if needed <= 0: break
+        # 1. Track Classes (Scan all chunks for safety, or just sample)
+        unique_classes.update(chunk[target_col].unique())
         
-        sample_list.append(chunk[feature_cols].iloc[:needed])
-        collected += len(sample_list[-1])
-
-    if not sample_list: return {}
+        # 2. Collect sample for bins
+        if collected < sample_rows:
+            feature_cols = [c for c in get_feature_cols(chunk) if c != target_col]
+            needed = sample_rows - collected
+            sample_list.append(chunk[feature_cols].iloc[:needed])
+            collected += len(sample_list[-1])
 
     full_sample = pd.concat(sample_list)
     X = full_sample.values
     quantiles = np.linspace(0, 1, q_bins + 1)
     
-    print(f"Computing quantiles for {X.shape[1]} features...")
     all_edges = np.quantile(X, quantiles, axis=0)
-    
     bin_edges = {col: np.unique(all_edges[:, i]) for i, col in enumerate(full_sample.columns)}
-    return bin_edges
+    
+    # Return sorted list of classes ensuring consistent ordering
+    return bin_edges, sorted(list(unique_classes))
 
-def compute_sequential_chi(df_iterator, target_col, bin_edges):
+def compute_sequential_chi(df_iterator, target_col, bin_edges, known_classes):
     """
     Pass 1: Sequentially builds contingency tables to calculate Chi-Squared scores.
-    Matches sklearn.feature_selection.chi2 behavior.
+    Correctly pre-initializes storage to avoid the 'skip all' bug.
     """
     print("Building Chi-Squared scores sequentially...")
     
-    global_counts = {} # {feature: 2D_array[bins, classes]}
-    classes = None
-    num_classes = 0
+    # 1. PRE-INITIALIZE global_counts
+    # We use known_classes and bin_edges to set the shape before looping
+    global_counts = {}
+    num_classes = len(known_classes)
+    
+    # Use the first chunk's schema just to identify which columns we have
+    # but initialize based on our global bin_edges
+    for col, edges in bin_edges.items():
+        num_bins = len(edges) - 1
+        global_counts[col] = np.zeros((num_bins, num_classes))
+
     total_samples = 0
 
     for chunk in df_iterator:
         feature_cols = [c for c in get_feature_cols(chunk) if c != target_col]
         
-        # Initialize categories on the first chunk
-        if classes is None:
-            y_categories = pd.Categorical(chunk[target_col])
-            classes = y_categories.categories
-            num_classes = len(classes)
-            print(f"Found {num_classes} classes: {list(classes)}")
-            
-            # Initialize global counts for each feature
-            for col in feature_cols:
-                if col in bin_edges:
-                    num_bins = len(bin_edges[col]) - 1
-                    global_counts[col] = np.zeros((num_bins, num_classes))
-                else:
-                    print(f"Warning: No bin edges found for feature {col}")
-        
-        # Process each feature in the chunk
         for col in feature_cols:
-            if col not in bin_edges or col not in global_counts:
+            if col not in global_counts:
                 continue
                 
-            # Discretize feature values
+            # Discretize using the global edges for this specific column
             try:
-                discretized = pd.cut(chunk[col], bins=bin_edges[col], include_lowest=True, labels=False)
+                discretized = pd.cut(chunk[col], bins=bin_edges[col], 
+                                     include_lowest=True, labels=False)
             except Exception as e:
-                print(f"Error discretizing {col}: {e}")
                 continue
             
-            # Update contingency table
-            for i, class_label in enumerate(classes):
+            # 2. UPDATE CONTINGENCY TABLE
+            # We iterate over known_classes directly
+            for i, class_label in enumerate(known_classes):
                 mask = (chunk[target_col] == class_label) & (~discretized.isna())
-                if mask.sum() > 0:
-                    bin_indices = discretized[mask].astype(int)
-                    for bin_idx in bin_indices:
-                        if 0 <= bin_idx < global_counts[col].shape[0]:
-                            global_counts[col][bin_idx, i] += mask.sum()
+                if mask.any():
+                    # Get the bin indices for rows belonging to this class
+                    bin_indices = discretized[mask].values.astype(int)
+                    
+                    # Vectorized update: count occurrences of each bin index
+                    counts = np.bincount(bin_indices, minlength=global_counts[col].shape[0])
+                    global_counts[col][:, i] += counts
         
         total_samples += len(chunk)
-    
-    print(f"Processed {total_samples} total samples")
-    print(f"Computed contingency tables for {len(global_counts)} features")
-    
-    # Calculate Chi-Squared scores
+
+    # 3. CALCULATE CHI-SQUARED SCORE
+    # Formula: sum((O - E)^2 / E)
     chi_scores = {}
     for col, counts in global_counts.items():
-        # Skip if no data
         if counts.sum() == 0:
             chi_scores[col] = 0.0
             continue
             
-        try:
-            # Calculate expected frequencies
-            col_sums = counts.sum(axis=0)
-            row_sums = counts.sum(axis=1)
-            total = counts.sum()
-            
-            expected = np.outer(row_sums, col_sums) / total
-            
-            # Avoid division by zero
-            mask = expected > 0
-            if not mask.any():
-                chi_scores[col] = 0.0
-                continue
-                
-            chi_sq = ((counts - expected) ** 2 / expected)[mask].sum()
+        col_sums = counts.sum(axis=0) # Sum per class
+        row_sums = counts.sum(axis=1) # Sum per bin
+        total = counts.sum()
+        
+        # Expected frequencies matrix
+        expected = np.outer(row_sums, col_sums) / total
+        
+        mask = expected > 0
+        if not mask.any():
+            chi_scores[col] = 0.0
+        else:
+            # The actual Chi-Square calculation
+            chi_sq = np.sum((counts[mask] - expected[mask])**2 / expected[mask])
             chi_scores[col] = chi_sq
             
-        except Exception as e:
-            print(f"Error calculating chi-squared for {col}: {e}")
-            chi_scores[col] = 0.0
-    
-    result = pd.Series(chi_scores)
-    print(f"Chi-Squared computation complete. Non-zero scores: {(result > 0).sum()}/{len(result)}")
-    return result.sort_values(ascending=False)
+    return pd.Series(chi_scores).sort_values(ascending=False)
 
 def extract_candidates_only(df_iterator, target_col, candidates):
     """
@@ -259,7 +244,7 @@ def extract_candidates_only(df_iterator, target_col, candidates):
 # MAIN WORKFLOW
 # =============================================================================
 
-def run_feature_selection_pipeline(df_iterator_factory, target_col='class', max_amino=10, show_plots=False):
+def run_feature_selection_pipeline(df_iterator_factory, target_col='class', max_amino=10, show_plots=False, q_bins=5, sample_rows=20000, knee_S=5.0, bins=None, distortion_filename=None, use_numpy_arrays=True):
     """
     Integrated Pipeline accepting a callable factory to avoid generator exhaustion.
     
@@ -269,15 +254,15 @@ def run_feature_selection_pipeline(df_iterator_factory, target_col='class', max_
         max_amino: Maximum features for AMINO output
         show_plots: Whether to generate and display plots
     """
-    # Pass 0: Quantiles
-    bin_edges = estimate_bin_edges(df_iterator_factory(), target_col)
+    # Pass 0: Quantiles AND Class Discovery
+    bin_edges, discovered_classes = estimate_bin_edges_and_classes(df_iterator_factory(), target_col, q_bins=q_bins, sample_rows=sample_rows)
     
     # Pass 1: Statistics
-    chi_s = compute_sequential_chi(df_iterator_factory(), target_col, bin_edges)
+    chi_s = compute_sequential_chi(df_iterator_factory(), target_col, bin_edges, discovered_classes)
     
     # Knee Detection
     y_vals = sorted(chi_s.values, reverse=True)
-    kn = KneeLocator(range(1, len(y_vals) + 1), y_vals, curve='convex', direction='decreasing', S=5.0)
+    kn = KneeLocator(range(1, len(y_vals) + 1), y_vals, curve='convex', direction='decreasing', S=knee_S)
     threshold = kn.knee_y if kn.knee_y is not None else 0.0
     candidate_features = chi_s[chi_s >= threshold].index.tolist()
     
@@ -287,10 +272,8 @@ def run_feature_selection_pipeline(df_iterator_factory, target_col='class', max_
     if show_plots:
         plot_chi_squared_scores(chi_s, bin_edges)
 
-    # Stability Cap for AMINO (reduced for performance)
-    if len(candidate_features) > 50:  # Reduced from 250 to 50
-        candidate_features = chi_s.head(50).index.tolist()
-        print(f"Limited candidates to {len(candidate_features)} for AMINO performance")
+    # Stability Cap for AMINO
+    # Removed automatic truncation to allow all qualified candidates
     
     # Pass 2: Load Candidates
     df_amino_input = extract_candidates_only(df_iterator_factory(), target_col, candidate_features)
@@ -304,39 +287,39 @@ def run_feature_selection_pipeline(df_iterator_factory, target_col='class', max_
         return df_amino_input[final_names + [target_col]]
     
     print(f"Running AMINO on {len(candidate_features)} candidates...")
-    try:
-        # Add progress tracking
-        import time
-        start_time = time.time()
-        
+    
+    # Add progress tracking
+    import time
+    start_time = time.time()
+    
+    # Choose data format based on parameter
+    if use_numpy_arrays:
+        ops = [amino.OrderParameter(name, df_amino_input[name].values) for name in candidate_features]
+    else:
         ops = [amino.OrderParameter(name, df_amino_input[name].tolist()) for name in candidate_features]
-        print(f"Created {len(ops)} order parameters in {time.time() - start_time:.2f}s")
-        
-        # Reduce bins for faster computation
+    print(f"Created {len(ops)} order parameters in {time.time() - start_time:.2f}s")
+    
+    # Use provided bins or adaptive calculation
+    if bins is None:
         bins = min(10, max(5, len(candidate_features) // 5))  # Adaptive bins
-        print(f"Using {bins} bins for AMINO clustering")
-        
-        final_ops = amino.find_ops(ops, max_outputs=max_amino, bins=bins, distortion_filename=None)
-        
-        elapsed = time.time() - start_time
-        print(f"AMINO completed in {elapsed:.2f}s")
-        
-        if not final_ops:
-            print("AMINO returned no operations, using top features instead")
-            final_names = candidate_features[:max_amino] if len(candidate_features) > max_amino else candidate_features
-        else:
-            final_names = [str(op) for op in final_ops]
-        
-        # Plot AMINO results if requested
-        if show_plots:
-            plot_amino_results(final_names, final_ops)
-        
-        # Return the selected features + class + metadata for downstream analysis
-        return df_amino_input[final_names + [target_col]]
-    except Exception as e:
-        print(f"AMINO processing failed: {e}. Falling back to top features.")
-        final_names = candidate_features[:max_amino] if len(candidate_features) > max_amino else candidate_features
-        return df_amino_input[final_names + [target_col]]
+    print(f"Using {bins} bins for AMINO clustering")
+    
+    final_ops = amino.find_ops(ops, max_outputs=max_amino, bins=bins, distortion_filename=distortion_filename)
+    
+    elapsed = time.time() - start_time
+    print(f"AMINO completed in {elapsed:.2f}s")
+    
+    if not final_ops:
+        raise ValueError("AMINO returned no operations - this indicates a problem with the input data or parameters")
+    else:
+        final_names = [str(op) for op in final_ops]
+    
+    # Plot AMINO results if requested
+    if show_plots:
+        plot_amino_results(final_names, final_ops)
+    
+    # Return the selected features + class + metadata for downstream analysis
+    return df_amino_input[final_names + [target_col]]
 
 if __name__ == "__main__":
     # Example usage:

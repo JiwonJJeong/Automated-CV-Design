@@ -77,26 +77,36 @@ def compute_streaming_fisher(df_iterator, target_col):
 # --- BPSO PROBLEM CLASS ---
 
 class SVMFeatureSelection(Problem):
-    def __init__(self, X_train, y_train, alpha=0.95):
+    def __init__(self, X_train, y_train, alpha=0.95, threshold=0.5, n_estimators=3, max_samples=0.8, cv=3):
         # FIX: Explicit float bounds
         super().__init__(dimension=X_train.shape[1], lower=0.0, upper=1.0)
         self.X_train = X_train
         self.y_train = y_train
         self.alpha = alpha
+        self.threshold = threshold
+        self.n_estimators = n_estimators
+        self.max_samples = max_samples
+        self.cv = cv
 
     def _evaluate(self, x):
-        selected = x > 0.5
-        n_selected = selected.sum()
+        # Sigmoid function: maps velocity/position to a probability
+        # 1 / (1 + exp(-x))
+        probability = 1 / (1 + np.exp(-x))
         
-        if n_selected == 0: 
+        # In canonical BPSO, we'd use a random flip: np.random.rand() < probability
+        # But for deterministic evaluation in NiaPy, thresholding the probability is safer:
+        selected = probability > self.threshold
+        
+        n_selected = selected.sum()
+        if n_selected == 0:
             return 1.0
         
         # Optimization: Reduce estimators to 3 for faster convergence during search
         clf = OneVsRestClassifier(BaggingClassifier(
             LinearSVC(dual=False, tol=1e-3), 
             n_jobs=1, # Important: Set inner jobs to 1 to avoid over-subscription if NiaPy parallelizes
-            n_estimators=3, 
-            max_samples=0.8
+            n_estimators=self.n_estimators, 
+            max_samples=self.max_samples
         ))
         
         try:
@@ -105,41 +115,26 @@ class SVMFeatureSelection(Problem):
             
             # FIX 3: Robust CV Strategy
             if min_class_size < 2:
-                # Cannot do CV with a singleton class. 
-                # Fallback: simple train/test split or penalty.
-                return 1.0 # Penalize solutions that rely on insufficient data
+                return 1.0  # Penalty for insufficient samples
             
-            # Standard logic: Use 3-fold if possible, otherwise LOO equivalent
-            cv_splits = 3 if min_class_size >= 3 else 2
-            
-            acc = cross_val_score(
-                clf, 
-                self.X_train[:, selected], 
-                self.y_train, 
-                cv=cv_splits, 
-                scoring='accuracy',
-                n_jobs=-1 # Parallelize at the CV level
-            ).mean()
-            
+            cv_folds = min(self.cv, min_class_size)
+            accuracy = cross_val_score(clf, self.X_train[:, selected], self.y_train, cv=cv_folds, n_jobs=-1).mean()
         except ValueError:
             # Catch "n_splits=2 cannot be greater than the number of members in each class"
             return 1.0
         except Exception:
             return 1.0
             
-        # Objective: Minimize Error (1-acc) + Penalty for feature count
-        score = self.alpha * (1.0 - acc) + (1.0 - self.alpha) * (n_selected / self.dimension)
+        score = self.alpha * (1 - accuracy) + (1 - self.alpha) * (n_selected / self.X_train.shape[1])
         return score
         
 # --- MAIN PIPELINE ---
 
-def run_bpso_pipeline(df_iterator_factory, target_col='class', candidate_limit=150, bpso_iters=30, seed=None):
+def run_bpso_pipeline(df_iterator_factory, target_col='class', candidate_limit=150, seed=None, alpha=0.95, threshold=0.5, n_estimators=3, max_samples=0.8, cv=3, population_size=None, pop_scaling=0.2, min_pop=20, max_pop=60, iters_scaling=0.5, min_iters=30, max_iters=100):
     """
-    Integrated Pipeline accepting a callable factory to avoid generator exhaustion.
-    Optimized for memory efficiency and total metadata preservation.
+    Integrated Pipeline with Dynamic Scaling for Population and Iterations.
     """
     # 1. Pass 1: Statistics (Fisher Filter)
-    # We call the factory to get a fresh iterator for Pass 1
     fisher_scores = compute_streaming_fisher(df_iterator_factory(), target_col)
     
     if fisher_scores.empty:
@@ -151,19 +146,16 @@ def run_bpso_pipeline(df_iterator_factory, target_col='class', candidate_limit=1
     # 2. Pass 2: Selective RAM Load
     print(f"Pass 2: Loading top {len(candidates)} features into memory...")
     
-    # DYNAMIC METADATA IDENTIFICATION
-    # Peek at one chunk to see which metadata columns are actually present
     try:
         sample_chunk = next(df_iterator_factory())
         existing_metadata = [c for c in METADATA_COLS if c in sample_chunk.columns]
     except StopIteration:
         return pd.DataFrame()
 
-    # Ensure target_col and all available metadata are preserved in the load list
     cols_to_keep = candidates + [target_col] + existing_metadata
     
+    # Optimization 3: Memory-safe generation/extraction
     data_list = []
-    # Call factory again for the second full pass
     for chunk in df_iterator_factory():
         available = [c for c in cols_to_keep if c in chunk.columns]
         data_list.append(chunk[available])
@@ -175,24 +167,36 @@ def run_bpso_pipeline(df_iterator_factory, target_col='class', candidate_limit=1
     X = narrow_df[candidates].values
     y = narrow_df[target_col].values
 
-    # 3. Optimization
-    print(f"Running BPSO on {X.shape[1]} features...")
-    problem = SVMFeatureSelection(X, y)
-    task = Task(problem, max_iters=bpso_iters)
+    # 3. Dynamic Optimization Parameters
+    n_feats = X.shape[1]
     
-    algorithm = ParticleSwarmOptimization(population_size=15, seed=seed)
+    # Population scaling with manual override
+    if population_size is None:
+        dynamic_pop = int(np.clip(n_feats * pop_scaling, min_pop, max_pop))
+    else:
+        dynamic_pop = population_size
+        
+    # Iteration scaling with manual override  
+    dynamic_iters = int(np.clip(n_feats * iters_scaling, min_iters, max_iters))
+
+    print(f"Running BPSO on {n_feats} features (Pop: {dynamic_pop}, Iters: {dynamic_iters})...")
+    
+    problem = SVMFeatureSelection(X, y, alpha=alpha, threshold=threshold, n_estimators=n_estimators, max_samples=max_samples, cv=cv)
+    task = Task(problem, max_iters=dynamic_iters)
+    
+    # Initialize algorithm with dynamic population
+    algorithm = ParticleSwarmOptimization(population_size=dynamic_pop, seed=seed)
     
     best_x, _ = algorithm.run(task)
-    final_mask = best_x > 0.5
+    
+    # Final mask logic (matches the sigmoid/clamping in _evaluate)
+    final_mask = (1 / (1 + np.exp(-best_x))) > threshold
     final_features = [candidates[i] for i, m in enumerate(final_mask) if m]
     
     print(f"Final selection: {len(final_features)} features.")
     
     # 4. Final Assembly
-    # Grab everything that was in narrow_df but NOT in the candidates list
-    # This automatically includes target_col, replica, frame_number, etc.
     other_cols = [c for c in narrow_df.columns if c not in candidates]
-    
     return narrow_df[final_features + other_cols]
 
 if __name__ == "__main__":

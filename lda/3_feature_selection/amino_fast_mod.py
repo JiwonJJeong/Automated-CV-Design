@@ -32,7 +32,17 @@ class OrderParameter:
     # name should be unique to the Order Parameter being defined
     def __init__(self, name, traj):
         self.name = name
-        self.traj = np.array(traj).reshape([-1,1])/np.std(traj)
+        # If already a numpy array, avoid making a full copy
+        if isinstance(traj, np.ndarray):
+            self.traj = traj.reshape([-1, 1])
+        else:
+            self.traj = np.array(traj).reshape([-1, 1])
+            
+        std_traj = np.std(self.traj)
+        if std_traj > 1e-12:
+            self.traj = self.traj / std_traj
+        else:
+            self.traj = np.zeros_like(self.traj)
 
     def __eq__(self, other):
         return self.name == other.name
