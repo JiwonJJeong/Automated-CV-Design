@@ -7,7 +7,9 @@ def run_flda(
     num_eigenvector=2,
     target_col='class',
     save_csv=False,
-    output_csv='FLDA.csv'
+    output_csv='FLDA.csv',
+    regularization=1e-6,
+    solver='eig'
 ):
     # 1. Handle Input (DataFrame or Iterator)
     if hasattr(data, '__iter__') and not isinstance(data, pd.DataFrame):
@@ -64,11 +66,20 @@ def run_flda(
 
     # 6. Solve Generalized Eigenvalue Problem
     # Regularization is crucial for singular matrices (e.g., in property tests)
-    S_W += np.eye(num_descriptor) * 1e-7 
+    S_W += np.eye(num_descriptor) * regularization
     
-    # Use eigh if SB and SW were guaranteed symmetric, but since we use inv(SW).dot(SB), 
-    # the result is non-symmetric. We use eig and take real parts.
-    eig_vals, eig_vecs = np.linalg.eig(np.linalg.inv(S_W).dot(S_B))
+    if solver == 'eig':
+        # Use eig for non-symmetric matrices (inv(SW).dot(SB))
+        eig_vals, eig_vecs = np.linalg.eig(np.linalg.inv(S_W).dot(S_B))
+    elif solver == 'eigh':
+        # Use eigh for symmetric matrices (more stable but requires symmetric input)
+        try:
+            eig_vals, eig_vecs = np.linalg.eigh(np.linalg.inv(S_W).dot(S_B))
+        except np.linalg.LinAlgError:
+            print("Warning: eigh failed, falling back to eig")
+            eig_vals, eig_vecs = np.linalg.eig(np.linalg.inv(S_W).dot(S_B))
+    else:
+        raise ValueError(f"Unknown solver: {solver}. Use 'eig' or 'eigh'.")
 
     # 7. Select and Sort Components
     eig_pairs = [(np.abs(eig_vals[i]), eig_vecs[:,i]) for i in range(len(eig_vals))]

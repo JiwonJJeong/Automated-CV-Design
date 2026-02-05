@@ -7,7 +7,11 @@ def run_pca(
     num_eigenvector=2,
     target_col='class',
     save_csv=False,
-    output_csv='PCA.csv'
+    output_csv='PCA.csv',
+    svd_solver='auto',
+    whiten=False,
+    tol=0.0,
+    max_iter=None
 ):
     """
     Perform PCA dimensionality reduction on input data.
@@ -67,7 +71,13 @@ def run_pca(
         raise ValueError("Cannot perform PCA: no features available.")
 
     ### STEP 3. Perform PCA
-    pca = PCA(n_components=num_eigenvector)
+    pca = PCA(
+        n_components=num_eigenvector,
+        svd_solver=svd_solver,
+        whiten=whiten,
+        tol=tol,
+        max_iter=max_iter
+    )
     pca_X = pca.fit_transform(X)
     print('Shape before PCA: ', X.shape)
     print('Shape after PCA: ', pca_X.shape)
