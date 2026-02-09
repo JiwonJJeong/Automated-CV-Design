@@ -34,8 +34,13 @@ def compute_sequential_fisher(df_iterator_factory, target_col):
     global_sum_sq = {}
     total_count = 0
     
+    feature_cols = None
+    
     for chunk in df_iterator_factory():
-        feature_cols = [c for c in get_feature_cols(chunk) if c != target_col]
+        if feature_cols is None:
+            # Explicitly exclude all metadata columns including 'time'
+            feature_cols = [c for c in get_feature_cols(chunk) if c not in METADATA_COLS]
+        
         y = chunk[target_col].values
         current_chunk_classes = np.unique(y)
         

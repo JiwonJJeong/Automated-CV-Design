@@ -136,12 +136,16 @@ def run_interactive_pipeline(data_factory, pipeline_configs, class_assignment_fu
     
     # --- PHASE 1: VARIANCE (Run before all else) ---
     print("\n" + "="*30 + "\nPHASE 1: VARIANCE\n" + "="*30)
-    var_params = get_params_minimal('variance')
     
     from feature_extraction.variance import variance_filter_pipeline
-    # Run variance filtering immediately
-    variance_result_gen = variance_filter_pipeline(data_factory(), **var_params)
-    variance_df = list(variance_result_gen)[0]
+    
+    # Use caching for variance filtering
+    variance_cache_path = cache_dir / "variance.pkl"
+    def variance_exec(params):
+        variance_result_gen = variance_filter_pipeline(data_factory, **params)
+        return list(variance_result_gen)[0]
+    
+    variance_df = run_interactive_step_generic("VARIANCE", variance_cache_path, 'variance', None, variance_exec)
     print(f"Variance Output: {variance_df.shape}")
     
     # --- CLASS ASSIGNMENT CHOICE ---
@@ -547,7 +551,9 @@ def summarize_and_evaluate(results, original_df, corr_threshold=0.5):
     scored_list = []
     for name, df in results.items():
         # Extract selected features from the pipeline result
-        selected_features = result.get('selected_features', [])
+        # Get the pipeline result data from final_results
+        pipeline_result = final_results[name]
+        selected_features = pipeline_result.get('selected_features', [])
         
         # Calculate Fisher score using only selected features
         score = evaluate_separability(df, selected_features=selected_features)

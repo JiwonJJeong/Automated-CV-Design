@@ -25,8 +25,9 @@ def compute_streaming_fisher(df_iterator, target_col, stride=1):
             chunk = chunk.iloc[::stride]
             
         if feature_cols is None:
+            # Explicitly exclude all metadata columns including 'time'
             feature_cols = [c for c in get_feature_cols(chunk) 
-                           if c != target_col and pd.api.types.is_numeric_dtype(chunk[c])]
+                           if c not in METADATA_COLS and pd.api.types.is_numeric_dtype(chunk[c])]
         
         y = chunk[target_col].values
         X_chunk = chunk[feature_cols].values

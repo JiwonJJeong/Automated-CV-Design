@@ -27,7 +27,9 @@ def compute_fisher_scores(df_iterator, target_col='class', stride=1):
             chunk = chunk.iloc[::stride]
             
         if feature_cols is None:
-            feature_cols = [c for c in get_feature_cols(chunk) if c != target_col]
+            # Explicitly exclude all metadata columns including 'time'
+            feature_cols = [c for c in get_feature_cols(chunk) 
+                           if c not in METADATA_COLS and pd.api.types.is_numeric_dtype(chunk[c])]
         
         y = chunk[target_col].values
         for label in np.unique(y):
@@ -151,9 +153,24 @@ def run_mpso_pipeline(df_iterator_factory, target_col='class', dims=5, candidate
         projected_chunk = np.matmul(X_chunk, final_sel) / projection_weights
         
         # 2. Rebuild the chunk with projected dimensions
+        # Create meaningful column names based on selected features
+        selected_feature_indices = np.where(best_x > threshold)[0]
+        selected_feature_names = [candidates[i] for i in selected_feature_indices]
+        
+        # For each projected dimension, find the most contributing original features
+        dim_columns = []
+        for dim_idx in range(dims):
+            # Get weights for this dimension across all selected features
+            dim_weights = final_sel[:, dim_idx]
+            # Get top contributing features (up to 3 for naming)
+            top_features_idx = np.argsort(dim_weights)[-3:]  # Top 3 contributors
+            top_features = [candidates[i] for i in top_features_idx if i < len(candidates)]
+            dim_name = "_".join(top_features[:2])  # Use top 2 for column name
+            dim_columns.append(f'MPSO_{dim_name}')
+        
         res_chunk = pd.DataFrame(
             projected_chunk, 
-            columns=[f'MPSO_Dim_{i+1}' for i in range(dims)],
+            columns=dim_columns,
             index=chunk.index
         )
         

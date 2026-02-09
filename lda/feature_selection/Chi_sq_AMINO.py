@@ -105,20 +105,20 @@ def estimate_bin_edges_and_classes(df_iterator, target_col, q_bins=5, sample_row
 def compute_sequential_chi(df_iterator, target_col, bin_edges, known_classes, stride=1):
     """Vectorized calculation of Chi-Squared scores to prevent performance lag."""
     print(f"Building Chi-Squared scores sequentially (stride={stride})...")
-
-    global_counts = {col: np.zeros((len(edges) - 1, len(known_classes))) for col, edges in bin_edges.items()}
+    stats = {}
     
     for chunk in df_iterator:
         if stride > 1:
             chunk = chunk.iloc[::stride]
-            
-        feature_cols = [c for c in get_feature_cols(chunk) if c != target_col]
+        
+        # Explicitly exclude all metadata columns including 'time'
+        feature_cols = [c for c in get_feature_cols(chunk) if c not in METADATA_COLS]
         
         # Pre-calculate class masks once per chunk for vectorization
         class_masks = {cls: (chunk[target_col] == cls).values for cls in known_classes}
 
         for col in feature_cols:
-            if col not in global_counts: continue
+            if col not in stats: stats[col] = np.zeros((len(bin_edges[col]) - 1, len(known_classes)))
             try:
                 # Use labels=False for speed boost; result is an array of bin indices
                 discretized = pd.cut(chunk[col], bins=bin_edges[col], include_lowest=True, labels=False).values
