@@ -386,7 +386,8 @@ def _filter_files_by_construct_subconstruct(data_files: List[Dict[str, str]],
 def data_iterator(base_dir: str = BASE_DIR, chunk_size: int = 10000, 
                  dataset_name: str = 'distances', 
                  constructs: Optional[List[str]] = None,
-                 subconstructs: Optional[List[str]] = None) -> Iterator[pd.DataFrame]:
+                 subconstructs: Optional[List[str]] = None,
+                 min_frame: int = 0) -> Iterator[pd.DataFrame]:
     """
     Unified data iterator that yields DataFrames from both H5 and NPY files.
     Automatically handles the mixed file structure and provides consistent output format.
@@ -397,6 +398,7 @@ def data_iterator(base_dir: str = BASE_DIR, chunk_size: int = 10000,
         dataset_name (str): Name of dataset to load from H5 files.
         constructs (List[str], optional): Filter by specific constructs only.
         subconstructs (List[str], optional): Filter by specific subconstructs only.
+        min_frame (int): Only include frames with frame_number >= min_frame (default: 0, include all).
         
     Yields:
         pd.DataFrame: Data chunk with consistent column structure.
@@ -422,9 +424,9 @@ def data_iterator(base_dir: str = BASE_DIR, chunk_size: int = 10000,
     for file_info in data_files:
         try:
             if file_info["type"] == "h5":
-                yield from _iterate_h5_file(file_info, chunk_size, dataset_name)
+                yield from _iterate_h5_file(file_info, chunk_size, dataset_name, min_frame)
             elif file_info["type"] == "npy":
-                yield from _iterate_npy_file(file_info, chunk_size)
+                yield from _iterate_npy_file(file_info, chunk_size, min_frame)
                     
         except Exception as e:
             data_iterator._error_count += 1
@@ -435,7 +437,7 @@ def data_iterator(base_dir: str = BASE_DIR, chunk_size: int = 10000,
                 print("... (suppressing further error messages)")
             continue
 
-def _iterate_h5_file(file_info: Dict[str, str], chunk_size: int, dataset_name: str) -> Iterator[pd.DataFrame]:
+def _iterate_h5_file(file_info: Dict[str, str], chunk_size: int, dataset_name: str, min_frame: int = 0) -> Iterator[pd.DataFrame]:
     """Helper function to iterate over H5 files."""
     with h5py.File(file_info["path"], 'r') as f:
         # Determine the actual dataset name
@@ -469,9 +471,16 @@ def _iterate_h5_file(file_info: Dict[str, str], chunk_size: int, dataset_name: s
             
             # Add metadata columns
             df = _add_metadata_columns(df, file_info, start_idx, end_idx, times)
-            yield df
+            
+            # Filter by minimum frame number
+            if min_frame > 0:
+                df = df[df['frame_number'] >= min_frame].copy()
+            
+            # Only yield if we have data after filtering
+            if len(df) > 0:
+                yield df
 
-def _iterate_npy_file(file_info: Dict[str, str], chunk_size: int) -> Iterator[pd.DataFrame]:
+def _iterate_npy_file(file_info: Dict[str, str], chunk_size: int, min_frame: int = 0) -> Iterator[pd.DataFrame]:
     """Helper function to iterate over NPY files."""
     # Map-read the npy for memory efficiency
     data = np.load(file_info["path"], mmap_mode='r')
@@ -495,7 +504,14 @@ def _iterate_npy_file(file_info: Dict[str, str], chunk_size: int) -> Iterator[pd
         
         # Add metadata columns
         df = _add_metadata_columns(df, file_info, start_idx, end_idx, times)
-        yield df
+        
+        # Filter by minimum frame number
+        if min_frame > 0:
+            df = df[df['frame_number'] >= min_frame].copy()
+        
+        # Only yield if we have data after filtering
+        if len(df) > 0:
+            yield df
 
 def _get_dataset_name(h5_file: h5py.File, dataset_name: str) -> Optional[str]:
     """Helper function to determine the actual dataset name in H5 file."""
@@ -616,12 +632,14 @@ def create_dataframe_factory(base_dir: str = BASE_DIR,
                              subconstructs: Optional[List[str]] = None,
                              apply_boundary_filter: bool = True, # Added Toggle
                              n_edge: int = 3,
+                             min_frame: int = 0,
                              **kwargs):
     
     def factory():
         iterator = data_iterator(base_dir=base_dir, 
                                  constructs=constructs, 
                                  subconstructs=subconstructs, 
+                                 min_frame=min_frame,
                                  **kwargs)
         
         for chunk in iterator:

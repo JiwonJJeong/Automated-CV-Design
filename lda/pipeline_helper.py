@@ -15,49 +15,75 @@ from feature_extraction.variance import variance_filter_pipeline
 
 DEFAULT_PARAMETERS = {
     'variance': {
-        'show_plot': True,
+        'show_plot': False,
         'knee_S': 1.0,
         'outlier_multiplier': 3.0,
         'fallback_percentile': 90,
-        'min_clean_ratio': 0.5
+        'min_clean_ratio': 0.5,
+        'plot_pause': 3.0
     },
     'feature_selection': {
-        'fisher_amino': {
-            'max_outputs': 5,      # Maps to 'max_outputs' in your pipeline
-            'knee_S': 1.0,         # Sensitivity for the KneeLocator
-        },
         'bpso': {
-            'population_size': 20, 
-            'iters_scaling': 0.5, # Controls dynamic iterations
-            'alpha': 0.95, 
-            'threshold': 0.5, 
-            'stride': 5,
-            'candidate_limit': 150
+            'n_particles': 30,
+            'max_iter': 100,
+            'w': 0.729,
+            'c1': 1.49445,
+            'c2': 1.49445
         },
         'mpso': {
-            'dims': 5,
-            'candidate_limit': 250, 
-            'mpso_iters': 50, 
-            'alpha': 0.9, 
-            'threshold': 0.5, 
-            'stride': 5,
-            'population_size': 20
+            'population_size': 50,
+            'max_iter': 100,
+            'alpha': 0.9,
+            'threshold': 0.5
+        },
+        'fisher_amino': {
+            'max_outputs': 5,
+            'knee_S': 1.0
         },
         'chi_sq_amino': {
-            'max_amino': 10, 
-            'q_bins': 5, 
-            'knee_S': 5.0, 
-            'sample_rows': 20000, 
-            'stride': 10,  # Increased default stride for Chi-Sq stats
-            'show_plots': True
+            'stride': 5,
+            'max_amino': 10,
+            'q_bins': 5,
+            'sample_rows': 20000,
+            'knee_S': 5.0
         }
     },
     'dimensionality_reduction': {
-        'flda': {'solver': 'eig'},
-        'pca': {'num_eigenvector': 2},
-        'zhlda': {'num_eigenvector': 5},
-        'mhlda': {'num_eigenvector': 5},
-        'gdhlda': {'num_eigenvector': 5}
+        'flda': {
+            'num_eigenvector': 2,
+            'regularization': 1e-6
+        },
+        'pca': {
+            'num_eigenvector': 2,
+            'svd_solver': 'auto'
+        },
+        'zhlda': {
+            'num_eigenvector': 2,
+            'learning_rate': 0.0001,
+            'num_iteration': 2000,
+            'stop_crit': 50,
+            'convergence_threshold': 1e-6
+        },
+        'mhlda': {
+            'num_eigenvector': 2,
+            'regularization': 1e-4,
+            'learning_rate': 0.0001,
+            'num_iteration': 2000,
+            'stop_crit': 50,
+            'convergence_threshold': 1e-6
+        },
+        'gdhlda': {
+            'num_eigenvector': 2,
+            'learning_rate': 0.0001,
+            'num_iteration': 2000,
+            'stop_crit': 50,
+            'convergence_threshold': 1e-6
+        }
+    },
+    'clustering': {
+        'stride': 5,
+        'max_k': 15,
+        'show_plots': True
     }
 }
 
@@ -108,23 +134,55 @@ def run_interactive_pipeline(data_factory, pipeline_configs, class_assignment_fu
     cache_dir = Path("pipeline_cache")
     cache_dir.mkdir(exist_ok=True)
     
-    # --- PHASE 1: VARIANCE (Keep Interactive) ---
-    def var_exec(params):
-        print("⚙️ Streaming data into variance filter...")
-        return pd.concat(variance_filter_pipeline(data_factory, **params), ignore_index=True)
-
-    variance_df = run_interactive_step_generic(
-        "VARIANCE", cache_dir / "variance.pkl", 'variance', None, var_exec
-    )
-    if variance_df is None: return {}
+    # --- PHASE 1: VARIANCE (Run before all else) ---
+    print("\n" + "="*30 + "\nPHASE 1: VARIANCE\n" + "="*30)
+    var_params = get_params_minimal('variance')
+    
+    from feature_extraction.variance import variance_filter_pipeline
+    # Run variance filtering immediately
+    variance_result_gen = variance_filter_pipeline(data_factory(), **var_params)
+    variance_df = list(variance_result_gen)[0]
+    print(f"Variance Output: {variance_df.shape}")
+    
+    # --- CLASS ASSIGNMENT CHOICE ---
+    print("\n" + "="*30 + "\nCLASS ASSIGNMENT\n" + "="*30)
+    print("Choose class assignment method:")
+    print("1. Default: construct + subconstruct")
+    print("2. Clustering: K-means on variance-filtered features")
+    
+    choice = input("Enter choice (1/2): ").strip()
+    
+    if choice == '2':
+        # Use clustering-based class assignment
+        from cluster.gmm import run_global_clustering_pipeline
+        
+        print("\nRunning clustering for class assignment...")
+        # Get clustering parameters interactively
+        cluster_params = get_params_minimal('clustering')
+        
+        # Create factory from variance data
+        def variance_factory():
+            yield variance_df
+        
+        # Run clustering pipeline with user parameters
+        clustered_df = run_global_clustering_pipeline(variance_factory, target_col='class', **cluster_params)
+        
+        # Add cluster labels as class column
+        variance_df['class'] = 'cluster_' + clustered_df['global_cluster_id'].astype(str)
+        print(f"Assigned {clustered_df['global_cluster_id'].nunique()} cluster-based classes")
+        
+        # Show cluster composition
+        from cluster.gmm import analyze_cluster_composition
+        analyze_cluster_composition(clustered_df, target_col='class', cluster_col='global_cluster_id')
+        
+    else:
+        # Default class assignment
+        variance_df['class'] = variance_df['construct'] + '_' + variance_df['subconstruct']
+        print(f"Assigned {variance_df['class'].nunique()} construct-based classes")
 
     # --- PHASE 2: FEATURE SELECTION (Keep Interactive) ---
     fs_methods = list(set(c['feature_selection'] for c in pipeline_configs))
     fs_paths = {}
-
-    if 'class' not in variance_df.columns:
-        variance_df['class'] = class_assignment_func(variance_df) if class_assignment_func else \
-                               variance_df['construct'] + '_' + variance_df['subconstruct']
 
     for method in fs_methods:
         path = cache_dir / f"{method}.pkl"
