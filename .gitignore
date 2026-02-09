@@ -5,3 +5,7 @@ __pycache__/
 data/
 
 .hypothesis/
+
+/lda/pipeline_cache
+
+.ipynb_checkpoints/

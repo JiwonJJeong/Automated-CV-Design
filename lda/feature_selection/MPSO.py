@@ -14,14 +14,18 @@ from data_access import get_feature_cols, METADATA_COLS
 
 # --- PASS 1: STREAMING FISHER ---
 
-def compute_fisher_scores(df_iterator, target_col='class'):
-    """Memory-efficient Fisher scores using a data stream."""
-    print("Pass 1: Computing Fisher scores for feature filtering...")
+def compute_fisher_scores(df_iterator, target_col='class', stride=1):
+    """Memory-efficient Fisher scores with stride support."""
+    print(f"Pass 1: Computing Fisher scores (stride={stride})...")
     stats = {}
     feature_cols = None
     total_n = 0
 
     for chunk in df_iterator:
+        # APPLY STRIDE TO PASS 1
+        if stride > 1:
+            chunk = chunk.iloc[::stride]
+            
         if feature_cols is None:
             feature_cols = [c for c in get_feature_cols(chunk) if c != target_col]
         
@@ -66,9 +70,15 @@ class MPSOProjectionProblem(Problem):
         self.n_estimators = n_estimators
         self.cv = cv
         self.n_feats = X_train.shape[1]
+        self.eval_count = 0  # Track progress
 
     def _evaluate(self, x):
         # Selection Matrix (Features x Dims)
+        self.eval_count += 1
+        
+        # Print progress every 50 evaluations
+        if self.eval_count % 50 == 0:
+            print(f"  > Evaluations completed: {self.eval_count}...", end='\r')
         sel_matrix = (x > self.threshold).reshape((self.n_feats, self.dims))
         
         if np.any(np.sum(sel_matrix, axis=0) == 0):
@@ -84,68 +94,83 @@ class MPSOProjectionProblem(Problem):
         return self.alpha * (1 - acc) + (1 - self.alpha) * sparsity
 
 # --- MAIN PIPELINE ---
-
-def run_mpso_pipeline(df_iterator_factory, target_col='class', dims=5, candidate_limit=250, mpso_iters=40, alpha=0.9, threshold=0.5, population_size=None, pop_scaling=0.02, min_pop=40, max_pop=100, n_estimators=5, cv=3, seed=42):
+def run_mpso_pipeline(df_iterator_factory, target_col='class', dims=5, candidate_limit=250, mpso_iters=10, alpha=0.9, threshold=0.5, population_size=None, pop_scaling=0.02, min_pop=40, max_pop=100, n_estimators=5, cv=3, seed=42, stride=1):
     """
-    Integrated Pipeline accepting a callable factory.
-    Synchronized with Chi-Sq and BPSO architecture.
+    Integrated Pipeline: Optimizes on strided data, returns FULL projected dataset.
     """
-    # 1. Pass 1: Filter
-    fisher_scores = compute_fisher_scores(df_iterator_factory(), target_col)
+    # 1. Pass 1: Filter (Strided)
+    fisher_scores = compute_fisher_scores(df_iterator_factory(), target_col, stride=stride)
     if fisher_scores.empty:
         return pd.DataFrame()
         
     candidates = fisher_scores.index[:candidate_limit].tolist()
     
-    # 2. Pass 2: Selective RAM Load
-    print(f"Pass 2: Loading top {len(candidates)} features for MPSO...")
-    data_list = []
-    # Consistent metadata preservation
-    meta_to_keep = [c for c in ['time', 'frame_number', 'replica'] if c in METADATA_COLS]
-    cols_to_keep = candidates + [target_col] + meta_to_keep
+    # 2. Pass 2: Selective RAM Load (Strided for MPSO)
+    print(f"Pass 2: Loading search data (stride={stride})...")
+    search_data = []
+    # FIX: Dynamically identify all available metadata from your config
+    meta_to_keep = [c for c in METADATA_COLS if c != target_col]
     
     for chunk in df_iterator_factory():
-        available = [c for c in cols_to_keep if c in chunk.columns]
-        data_list.append(chunk[available])
+        if stride > 1:
+            chunk = chunk.iloc[::stride]
+        available = [c for c in candidates + [target_col] + meta_to_keep if c in chunk.columns]
+        search_data.append(chunk[available])
     
-    full_df = pd.concat(data_list, ignore_index=True)
-    X = full_df[candidates].values
-    y = full_df[target_col].values
+    temp_df = pd.concat(search_data, ignore_index=True)
+    X_search = temp_df[candidates].values
+    y_search = temp_df[target_col].values
     
-    del data_list
+    del search_data
     gc.collect()
 
-    # 3. Particle Swarm Optimization
-    # Scale population for larger search space (1250 variables vs 150 in BPSO)
+    # 3. Particle Swarm Optimization (Still runs on strided data for speed)
     if population_size is None:
         dynamic_pop = int(np.clip(len(candidates) * dims * pop_scaling, min_pop, max_pop))
     else:
         dynamic_pop = population_size
-    print(f"Running MPSO on {len(candidates)} features x {dims} dims = {len(candidates) * dims} variables (Pop: {dynamic_pop})")
-    
-    problem = MPSOProjectionProblem(X, y, dims=dims, alpha=alpha, threshold=threshold, n_estimators=n_estimators, cv=cv)
+        
+    print(f"Running MPSO on {X_search.shape[0]} strided samples...")
+    problem = MPSOProjectionProblem(X_search, y_search, dims=dims, alpha=alpha, threshold=threshold, n_estimators=n_estimators, cv=cv)
     task = Task(problem, max_iters=mpso_iters)
     algorithm = ParticleSwarmOptimization(population_size=dynamic_pop, seed=seed)
     
-    print("Beginning Swarm Optimization...")
     best_x, _ = algorithm.run(task)
     
-    # 4. Final Transform
+    # Generate the "Recipe" matrix
     final_sel = (best_x > threshold).reshape((len(candidates), dims))
-    # Normalize projection by number of features contributing to each dimension
-    projected_vals = np.matmul(X, final_sel) / (np.sum(final_sel, axis=0) + 1e-12)
-    
-    # Construct final DataFrame
-    res_df = pd.DataFrame(projected_vals, columns=[f'MPSO_Dim_{i+1}' for i in range(dims)])
-    
-    # Re-attach target and metadata
-    res_df[target_col] = y
-    for meta in meta_to_keep:
-        if meta in full_df.columns:
-            res_df[meta] = full_df[meta].values
+    projection_weights = np.sum(final_sel, axis=0) + 1e-12
 
-    print(f"MPSO Complete. Reduced {X.shape[1]} features to {dims} dimensions.")
-    return res_df
+    # --- FIX: Pass 3 - Apply to FULL Dataset ---
+    print("Pass 3: Applying optimized projection to the FULL dataset...")
+    full_results = []
+    
+    for chunk in df_iterator_factory():
+        # 1. Project the candidate features
+        X_chunk = chunk[candidates].values
+        projected_chunk = np.matmul(X_chunk, final_sel) / projection_weights
+        
+        # 2. Rebuild the chunk with projected dimensions
+        res_chunk = pd.DataFrame(
+            projected_chunk, 
+            columns=[f'MPSO_Dim_{i+1}' for i in range(dims)],
+            index=chunk.index
+        )
+        
+        # 3. Carry over target and EVERY available metadata column
+        res_chunk[target_col] = chunk[target_col].values
+        
+        # Only grab metadata that actually exists in this specific chunk
+        current_meta = [c for c in meta_to_keep if c in chunk.columns]
+        for meta in current_meta:
+            res_chunk[meta] = chunk[meta].values
+        
+        full_results.append(res_chunk)
+
+    final_df = pd.concat(full_results, ignore_index=True)
+    
+    print(f"✅ MPSO Complete. Full dataset ({len(final_df)} rows) reduced to {dims} dimensions.")
+    return final_df
 
 if __name__ == "__main__":
     pass

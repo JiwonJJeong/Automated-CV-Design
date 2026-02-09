@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 from sklearn.decomposition import PCA
+from data_access import METADATA_COLS
 
 def run_pca(
     data,
@@ -44,22 +45,22 @@ def run_pca(
     if num_descriptor == 0:
         raise ValueError("No feature columns found in DataFrame (all columns are target column)")
     
-    # Infer class information
-    num_class = df[target_col].nunique()
-    class_counts = df[target_col].value_counts()
-    nDataPoints = class_counts.iloc[0]  # Assumes balanced classes
+    # 1. Infer parameters: Filter for numeric features only & ignore metadata
+    descriptor_list = [
+        col for col in df.columns 
+        if col != target_col 
+        and col not in METADATA_COLS 
+        and pd.api.types.is_numeric_dtype(df[col])
+    ]
     
-    print(f"Inferred parameters:")
-    print(f"  - Number of features: {num_descriptor}")
-    print(f"  - Number of classes: {num_class}")
-    print(f"  - Data points per class: {nDataPoints}")
-    print(f"  - Feature columns: {descriptor_list}")
-
-    ### STEP 2. Separate data and generate labels
-    X = df[descriptor_list].values
-    X = X.astype(np.float64)
+    num_descriptor = len(descriptor_list)
+    
+    if num_descriptor == 0:
+        raise ValueError("No numeric feature columns found (after filtering target and metadata).")
+    
+    # 2. Extract Data (Strictly Numeric)
+    X = df[descriptor_list].values.astype(np.float64)
     y = df[target_col].values
-    print(X)
 
     # Validate num_eigenvector against available features
     max_possible_pc = min(num_descriptor, num_eigenvector)
@@ -71,13 +72,21 @@ def run_pca(
         raise ValueError("Cannot perform PCA: no features available.")
 
     ### STEP 3. Perform PCA
-    pca = PCA(
-        n_components=num_eigenvector,
-        svd_solver=svd_solver,
-        whiten=whiten,
-        tol=tol,
-        max_iter=max_iter
-    )
+    # Standard PCA does not accept max_iter or tol in __init__ 
+    # unless using specific solvers like 'arpack'
+    pca_params = {
+        'n_components': num_eigenvector,
+        'svd_solver': svd_solver,
+        'whiten': whiten
+    }
+    
+    # Only add tol/max_iter if using the arpack solver
+    if svd_solver == 'arpack':
+        pca_params['tol'] = tols
+        pca_params['max_iter'] = max_iter
+
+    pca = PCA(**pca_params)
+    pca_X = pca.fit_transform(X)
     pca_X = pca.fit_transform(X)
     print('Shape before PCA: ', X.shape)
     print('Shape after PCA: ', pca_X.shape)
@@ -93,9 +102,9 @@ def run_pca(
     ### STEP 4. Calculate variances (eigenvalues) and CVs (eigenvectors)
     print('Variances:', pca.explained_variance_)
     print('Variance ratios:', pca.explained_variance_ratio_)
-    print('CVs:', pca.components_)
+    # print('CVs:', pca.components_)S
     
-    yield pca_df
+    return pca_df
 
 if __name__ == "__main__":
     # Example usage:

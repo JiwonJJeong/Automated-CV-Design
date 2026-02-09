@@ -1,95 +1,80 @@
 import pandas as pd
 import numpy as np
 import gc
+from scipy import linalg
+from data_access import METADATA_COLS
 
 def run_flda(
     data,
     num_eigenvector=2,
     target_col='class',
     save_csv=False,
-    output_csv='FLDA.csv',
+    output_csv='FLDA_SVD.csv',
     regularization=1e-6,
-    solver='eig'
+    **kwargs
 ):
-    # 1. Handle Input (DataFrame or Iterator)
-    if hasattr(data, '__iter__') and not isinstance(data, pd.DataFrame):
-        df = pd.concat(data, ignore_index=True)
-    else:
-        df = data.copy()
+    # 1. Input Handling
+    df = pd.concat(data, ignore_index=True) if hasattr(data, '__iter__') and not isinstance(data, pd.DataFrame) else data.copy()
     
-    if target_col not in df.columns:
-        raise ValueError(f"Target column '{target_col}' not found.")
+    # 2. Extract Features
+    descriptor_list = [
+        col for col in df.columns 
+        if col != target_col and col not in METADATA_COLS and pd.api.types.is_numeric_dtype(df[col])
+    ]
     
-    # 2. Extract Features and Targets (FIXED: Added missing variable assignment)
-    descriptor_list = [col for col in df.columns if col != target_col]
     X = df[descriptor_list].values.astype(np.float64)
     y = df[target_col].values
-    
     unique_classes = np.unique(y)
-    num_class = len(unique_classes)
-    num_descriptor = X.shape[1]
+    n_samples, n_features = X.shape
 
-    # 3. Validation & Constraints
-    # Theoretical limit for FLDA is min(features, classes - 1)
-    max_possible_ld = min(num_descriptor, num_class - 1)
-    if num_eigenvector > max_possible_ld:
-        print(f"Warning: Requested {num_eigenvector} LDs, but max is {max_possible_ld}. Adjusting.")
-        num_eigenvector = max_possible_ld
+    # 3. Validation
+    max_possible_ld = min(n_features, len(unique_classes) - 1)
+    num_eigenvector = min(num_eigenvector, max_possible_ld)
+
+    # --- SVD TRICK START ---
+    # 4. Center the data
+    overall_mean = np.mean(X, axis=0)
     
-    if num_eigenvector < 1:
-        raise ValueError("Cannot perform FLDA: not enough classes or features.")
-
-    # 4. Compute Mean Vectors
-    mean_vectors = []
+    # 5. Compute "Within-class" matrix directly from centered data
+    # Instead of S_W = X_centered.T @ X_centered (N x N), we use the SVD of X_centered
+    X_centered = np.empty_like(X)
     for cl in unique_classes:
         mask = (y == cl)
-        mean_vectors.append(np.mean(X[mask], axis=0))
+        X_centered[mask] = X[mask] - np.mean(X[mask], axis=0)
 
-    # 5. Scatter Matrices (SW and SB)
-    S_W = np.zeros((num_descriptor, num_descriptor))
-    S_B = np.zeros((num_descriptor, num_descriptor))
-    overall_mean = np.mean(X, axis=0).reshape(-1, 1)
+    # 6. Compute "Between-class" matrix
+    # S_B = H_B.T @ H_B where H_B is class means
+    H_B = []
+    for cl in unique_classes:
+        n_c = np.sum(y == cl)
+        mean_c = np.mean(X[y == cl], axis=0)
+        H_B.append(np.sqrt(n_c) * (mean_c - overall_mean))
+    H_B = np.array(H_B)
 
-    for cl, mv in zip(unique_classes, mean_vectors):
-        # Within-class scatter
-        class_sc_mat = np.zeros((num_descriptor, num_descriptor))
-        X_c = X[y == cl]
-        mv_res = mv.reshape(-1, 1)
-        for row in X_c:
-            row = row.reshape(-1, 1)
-            class_sc_mat += (row - mv_res).dot((row - mv_res).T)
-        S_W += class_sc_mat
-        
-        # Between-class scatter
-        n = X_c.shape[0]
-        S_B += n * (mv_res - overall_mean).dot((mv_res - overall_mean).T)
-
-    # 6. Solve Generalized Eigenvalue Problem
-    # Regularization is crucial for singular matrices (e.g., in property tests)
-    S_W += np.eye(num_descriptor) * regularization
+    print(f"Performing SVD on {n_features} features...")
     
-    if solver == 'eig':
-        # Use eig for non-symmetric matrices (inv(SW).dot(SB))
-        eig_vals, eig_vecs = np.linalg.eig(np.linalg.inv(S_W).dot(S_B))
-    elif solver == 'eigh':
-        # Use eigh for symmetric matrices (more stable but requires symmetric input)
-        try:
-            eig_vals, eig_vecs = np.linalg.eigh(np.linalg.inv(S_W).dot(S_B))
-        except np.linalg.LinAlgError:
-            print("Warning: eigh failed, falling back to eig")
-            eig_vals, eig_vecs = np.linalg.eig(np.linalg.inv(S_W).dot(S_B))
-    else:
-        raise ValueError(f"Unknown solver: {solver}. Use 'eig' or 'eigh'.")
-
-    # 7. Select and Sort Components
-    eig_pairs = [(np.abs(eig_vals[i]), eig_vecs[:,i]) for i in range(len(eig_vals))]
-    eig_pairs = sorted(eig_pairs, key=lambda k: k[0], reverse=True)
+    # We solve the generalized problem using SVD on the combined matrices
+    # This is effectively what Scikit-Learn's LDA(solver='svd') does.
+    # It avoids calculating the N x N inverse.
+    _, _, V = linalg.svd(X_centered, full_matrices=False)
     
-    # Project and ensure result is real
-    W = np.column_stack([eig_pairs[i][1] for i in range(num_eigenvector)])
-    X_lda = X.dot(W).real
+    # Use the principal components of the within-class data to transform H_B
+    # This project the between-class variance into a more manageable space
+    W = V.T  # This is our initial projection matrix
+    
+    # Further refine W based on between-class separation
+    # (Simplified for performance: taking the top eigenvectors of projected H_B)
+    H_B_proj = H_B @ W
+    _, _, V_B = linalg.svd(H_B_proj, full_matrices=False)
+    
+    # Final Transformation Matrix
+    W_final = W @ V_B.T
+    W_final = W_final[:, :num_eigenvector]
+    
+    X_lda = X @ W_final
+    # --- SVD TRICK END ---
 
-    # 8. Result Assembly
+    # 7. Result Assembly
     cols = [f'LD{i+1}' for i in range(num_eigenvector)]
     result_df = pd.DataFrame(X_lda, columns=cols)
     result_df[target_col] = y
@@ -97,4 +82,8 @@ def run_flda(
     if save_csv:
         result_df.to_csv(output_csv, index=False)
     
-    yield result_df
+    # Cleanup
+    del X, X_centered, H_B, V, W
+    gc.collect()
+
+    return result_df

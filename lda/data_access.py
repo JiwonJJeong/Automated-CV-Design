@@ -363,30 +363,22 @@ def _filter_files_by_construct_subconstruct(data_files: List[Dict[str, str]],
     filtered_files = []
     
     for file_info in data_files:
-        file_path = file_info["path"]
-        filename = os.path.basename(file_path)
+        # Use metadata from get_data_files (directory structure) instead of filename parsing
+        file_construct = file_info.get("construct")
+        file_subconstruct = file_info.get("subconstruct")
         
-        # Extract construct and subconstruct from filename
-        # Expected format: construct_subconstruct_replica.ext
-        parts = filename.split('_')
+        if not file_construct or not file_subconstruct:
+            continue
+            
+        # Check construct filter
+        construct_match = (constructs is None) or (file_construct in constructs)
         
-        if len(parts) >= 2:
-            file_construct = parts[0]
-            file_subconstruct = parts[1]
-            
-            # Check construct filter
-            construct_match = (constructs is None) or (file_construct in constructs)
-            
-            # Check subconstruct filter  
-            subconstruct_match = (subconstructs is None) or (file_subconstruct in subconstructs)
-            
-            if construct_match and subconstruct_match:
-                filtered_files.append(file_info)
-                print(f"✅ Including: {filename} (construct: {file_construct}, subconstruct: {file_subconstruct})")
-            else:
-                print(f"🚫 Filtering: {filename} (construct: {file_construct}, subconstruct: {file_subconstruct})")
-        else:
-            print(f"⚠️  Unexpected filename format: {filename}")
+        # Check subconstruct filter  
+        subconstruct_match = (subconstructs is None) or (file_subconstruct in subconstructs)
+        
+        if construct_match and subconstruct_match:
+            filtered_files.append(file_info)
+            # print(f"✅ Including: {file_info['path']} ({file_construct}/{file_subconstruct})")
     
     print(f"📊 Filtered {len(data_files)} files down to {len(filtered_files)} matching criteria")
     return filtered_files
@@ -565,6 +557,7 @@ def _add_metadata_columns(df: pd.DataFrame, file_info: Dict[str, str],
 def list_available_constructs_subconstructs(base_dir: str = BASE_DIR) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
     """
     Scan data directory and return available constructs and subconstructs.
+    Uses directory structure instead of filename parsing for accuracy.
     
     Args:
         base_dir: Base directory containing data files
@@ -574,33 +567,40 @@ def list_available_constructs_subconstructs(base_dir: str = BASE_DIR) -> Tuple[D
         - constructs_dict: {construct: [subconstructs]}
         - subconstructs_dict: {subconstruct: [constructs]}
     """
-    data_files = get_data_files(base_dir)
-    
     constructs_dict = {}
     subconstructs_dict = {}
     
-    for file_info in data_files:
-        file_path = file_info["path"]
-        filename = os.path.basename(file_path)
-        
-        # Extract construct and subconstruct from filename
-        parts = filename.split('_')
-        
-        if len(parts) >= 2:
-            construct = parts[0]
-            subconstruct = parts[1]
+    base_path = Path(base_dir)
+    
+    # Scan directory structure: base_dir/construct/subconstruct/
+    for construct_dir in base_path.iterdir():
+        if not construct_dir.is_dir():
+            continue
             
+        construct_name = construct_dir.name
+        if construct_name not in constructs_dict:
+            constructs_dict[construct_name] = []
+            
+        for subconstruct_dir in construct_dir.iterdir():
+            if not subconstruct_dir.is_dir():
+                continue
+                
+            subconstruct_name = subconstruct_dir.name
+            
+            # Check if this subconstruct has data files
+            data_files = list(subconstruct_dir.glob("*_pairwise_dist.*"))
+            if not data_files:
+                continue
+                
             # Build constructs dict
-            if construct not in constructs_dict:
-                constructs_dict[construct] = []
-            if subconstruct not in constructs_dict[construct]:
-                constructs_dict[construct].append(subconstruct)
+            if subconstruct_name not in constructs_dict[construct_name]:
+                constructs_dict[construct_name].append(subconstruct_name)
             
             # Build subconstructs dict
-            if subconstruct not in subconstructs_dict:
-                subconstructs_dict[subconstruct] = []
-            if construct not in subconstructs_dict[subconstruct]:
-                subconstructs_dict[subconstruct].append(construct)
+            if subconstruct_name not in subconstructs_dict:
+                subconstructs_dict[subconstruct_name] = []
+            if construct_name not in subconstructs_dict[subconstruct_name]:
+                subconstructs_dict[subconstruct_name].append(construct_name)
     
     # Sort the lists
     for construct in constructs_dict:
@@ -612,24 +612,22 @@ def list_available_constructs_subconstructs(base_dir: str = BASE_DIR) -> Tuple[D
 
 
 def create_dataframe_factory(base_dir: str = BASE_DIR, 
-                           constructs: Optional[List[str]] = None,
-                           subconstructs: Optional[List[str]] = None,
-                           **kwargs):
-    """
-    Creates a DataFrame factory compatible with existing pipeline functions.
-    Returns a callable that creates a fresh iterator every time it's called.
+                             constructs: Optional[List[str]] = None,
+                             subconstructs: Optional[List[str]] = None,
+                             apply_boundary_filter: bool = True, # Added Toggle
+                             n_edge: int = 3,
+                             **kwargs):
     
-    Args:
-        base_dir (str): Base directory containing data files.
-        constructs (List[str], optional): Filter by specific constructs only.
-        subconstructs (List[str], optional): Filter by specific subconstructs only.
-        **kwargs: Additional arguments passed to data_iterator.
-        
-    Returns:
-        callable: Function that returns a fresh data_iterator when called.
-    """
     def factory():
-        return data_iterator(base_dir=base_dir, constructs=constructs, subconstructs=subconstructs, **kwargs)
+        iterator = data_iterator(base_dir=base_dir, 
+                                 constructs=constructs, 
+                                 subconstructs=subconstructs, 
+                                 **kwargs)
+        
+        for chunk in iterator:
+            if apply_boundary_filter:
+                chunk = filter_residue_boundaries(chunk, n_edge=n_edge)
+            yield chunk
     
     return factory
 
@@ -694,3 +692,38 @@ if __name__ == "__main__":
         chunk2 = next(factory())
         print(f"  Shape: {chunk2.shape}")
         print("✓ Factory successfully creates fresh iterators!")
+
+import re
+
+def filter_residue_boundaries(df, n_edge=3):
+    # Updated regex to match 'RES1_2' format from your get_residue_feature_names()
+    res_pattern = re.compile(r'RES(\d+)_(\d+)', re.IGNORECASE)
+    res_cols = [col for col in df.columns if res_pattern.match(col)]
+    
+    if not res_cols:
+        return df
+
+    # Extract indices
+    all_indices = []
+    for col in res_cols:
+        nums = res_pattern.match(col).groups()
+        all_indices.extend([int(nums[0]), int(nums[1])])
+    
+    unique_indices = sorted(list(set(all_indices)))
+    
+    # Define forbidden boundary numbers
+    low_bounds = set(unique_indices[:n_edge])
+    high_bounds = set(unique_indices[-n_edge:])
+    forbidden = low_bounds.union(high_bounds)
+    
+    cols_to_keep = []
+    for col in df.columns:
+        match = res_pattern.match(col)
+        if match:
+            idx1, idx2 = map(int, match.groups())
+            if idx1 not in forbidden and idx2 not in forbidden:
+                cols_to_keep.append(col)
+        else:
+            cols_to_keep.append(col) # Keep 'class', 'construct', etc.
+            
+    return df[cols_to_keep]

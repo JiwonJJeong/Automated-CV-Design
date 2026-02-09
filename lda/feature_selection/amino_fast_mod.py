@@ -14,7 +14,7 @@ import copy
 import dask
 import dask.multiprocessing
 from dask.diagnostics import ProgressBar
-dask.config.set(scheduler='processes')
+dask.config.set(scheduler='threads')
 
 class OrderParameter:
     """Order Parameter (OP) class - stores OP name and trajectory
@@ -645,7 +645,7 @@ def num_clust(distortion_array, num_array):
         if num_array[min_index] > num_ops:
             num_ops = num_array[min_index]
         
-        return num_ops
+    return num_ops
 
 # This is the general workflow for AMINO
 def find_ops(old_ops, max_outputs=20, bins=20, bandwidth=None, kernel='epanechnikov',
@@ -712,9 +712,6 @@ def find_ops(old_ops, max_outputs=20, bins=20, bandwidth=None, kernel='epanechni
 
     # This loops through each number of clusters
     while (max_outputs > 0):
-
-        print("Checking " + str(max_outputs) + " order parameters...")
-        print(old_ops)
         
         tmp_ops, disto = k_clusters(old_ops, max_outputs, mut)
 

@@ -3,8 +3,9 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from kneed import KneeLocator
 import h5py
+import gc
 
-METADATA_COLS = {'construct', 'subconstruct', 'replica', 'frame_number'}
+METADATA_COLS = {'construct', 'subconstruct', 'replica', 'frame_number', 'time'}
 
 def h5_chunk_iterator(h5_path, dataset_name='data', chunk_size=10000):
     """
@@ -30,8 +31,22 @@ def compute_streaming_variance(df_iterator):
     m2_a = None  
 
     for df in df_iterator:
+        #print(f"Available columns: {list(df.columns)}")
+        #print(f"Column dtypes: {dict(df.dtypes)}")
+        
         feature_cols = [c for c in df.columns if c not in METADATA_COLS]
-        data_b = df[feature_cols].values
+        #print(f"Feature columns after filtering: {feature_cols}")
+        
+        # Double-check for any non-numeric columns
+        numeric_cols = []
+        for col in feature_cols:
+            if df[col].dtype in ['int64', 'float64', 'int32', 'float32']:
+                numeric_cols.append(col)
+            else:
+                print(f"Non-numeric column found: {col} (dtype: {df[col].dtype})")
+        
+        # print(f"Final numeric columns: {numeric_cols}")
+        data_b = df[numeric_cols].values
         n_b = data_b.shape[0]
         
         if n_b == 0: continue
@@ -166,7 +181,6 @@ def plot_variance_distribution(variance_series, threshold=None):
     plt.tight_layout()
     
     plt.show(block=False)
-    plt.pause(plot_pause)  # Configurable pause duration
     # Don't close here - let it stay visible during computation
 
 def identify_problematic_features(variance_series, outlier_threshold=None):
@@ -188,93 +202,69 @@ def identify_problematic_features(variance_series, outlier_threshold=None):
     
     return outliers
 
-def variance_filter_pipeline(df_iterator, return_threshold=False, show_plot=False, knee_S=1.0, outlier_multiplier=3.0, fallback_percentile=90, min_clean_ratio=0.5, plot_pause=3.0):
+def variance_filter_pipeline(data_factory, return_threshold=False, show_plot=False, **kwargs):
     """
-    Two-pass memory-efficient variance filtering pipeline.
-    Pass 1: Calculate variance from iterator
-    Pass 2: Yield filtered data
-    
-    Args:
-        df_iterator: Iterator yielding DataFrames (must be consumable twice or provide fresh iterator)
-        return_threshold: If True, returns (filtered_iterator, threshold, selected_features)
-    
-    Yields:
-        pd.DataFrame: Filtered chunks with high-variance features + metadata columns
+    TRULY memory-efficient variance filtering.
+    Instead of a list, we call data_factory() twice to stream from disk.
     """
     # PASS 1: Calculate variance
-    print("Pass 1: Analyzing feature variance...")
+    print("Pass 1: Analyzing feature variance (Streaming from disk)...")
     
-    # Convert to list to allow two passes
-    # Note: This stores DataFrames in memory, but they're already chunked
-    df_chunks = list(df_iterator)
+    # We call the factory to get a FRESH iterator for Pass 1
+    pass1_iter = data_factory() 
+    variance_series = compute_streaming_variance(pass1_iter)
     
-    if not df_chunks:
-        print("Warning: No data chunks found")
-        return
-    
-    # Check if all chunks have the same columns
-    first_cols = set(df_chunks[0].columns)
-    for i, chunk in enumerate(df_chunks):
-        if set(chunk.columns) != first_cols:
-            print(f"Warning: Chunk {i} has different columns. Skipping variance filtering.")
-            # Just yield the original chunks without filtering
-            for chunk in df_chunks:
-                yield chunk
-            return
-    
-    variance_series = compute_streaming_variance(iter(df_chunks))
-    
+    # Immediately clear Pass 1 from memory
+    del pass1_iter
+    gc.collect()
+
     if len(variance_series) == 0:
-        print("Warning: No features found for variance calculation")
-        # Just yield the original chunks without filtering
-        for chunk in df_chunks:
-            yield chunk
-        return
+        print("Warning: No features found.")
+        return data_factory() # Return fresh stream of original data
+
+    # --- NEW: SANITY CHECK STEP ---
+    median_var = variance_series.median()
+    # Any feature with variance > 100x median is likely an error/metadata leak
+    sanity_threshold = median_var * 100 
     
-    threshold = get_knee_point(variance_series, knee_S=knee_S, outlier_multiplier=outlier_multiplier, fallback_percentile=fallback_percentile, min_clean_ratio=min_clean_ratio)
-    selected_features = variance_series[variance_series > threshold].index.tolist()
+    outliers = variance_series[variance_series > sanity_threshold]
     
-    # Identify and report problematic features
-    outliers = identify_problematic_features(variance_series)
-    
-    # Ensure we keep at least some features (minimum 5% or 50 features, whichever is smaller)
-    min_features = max(5, min(50, int(len(variance_series) * 0.05)))
-    
-    if len(selected_features) < min_features:
-        print(f"\nWarning: Only {len(selected_features)} features above threshold.")
-        print(f"Adjusting threshold to keep at least {min_features} features...")
+    if not outliers.empty:
+        print("\n" + "!"*60)
+        print(f"⚠️  SANITY CHECK WARNING: {len(outliers)} problematic features detected!")
+        print(f"Median variance: {median_var:.6f} | Sanity threshold: {sanity_threshold:.6f}")
+        for name, val in outliers.items():
+            print(f"   -> FEATURE: {name} | VARIANCE: {val:.2e} (REMOVED)")
+        print("!"*60 + "\n")
         
-        # Use percentile to ensure minimum features
-        adjusted_threshold = np.percentile(variance_series, (1 - min_features/len(variance_series)) * 100)
-        selected_features = variance_series[variance_series >= adjusted_threshold].index.tolist()
-        threshold = adjusted_threshold
-        print(f"New threshold: {threshold:.6f} | Retained: {len(selected_features)} features.")
-    else:
-        print(f"\nThreshold: {threshold:.6f} | Retained: {len(selected_features)} features.")
-    
-    # Plot variance distribution if requested
+        # Remove these from the series before knee detection and plotting
+        variance_series = variance_series.drop(outliers.index)
+
+    # ... (Knee detection logic remains the same) ...
+    threshold = get_knee_point(variance_series, **kwargs)
+    selected_features = variance_series[variance_series > threshold].index.tolist()
+
     if show_plot:
         plot_variance_distribution(variance_series, threshold)
 
     # PASS 2: Yield filtered data
-    for chunk in df_chunks:
-        # Identify columns to keep (Features > threshold + Metadata)
+    print(f"Pass 2: Filtering columns (Retaining {len(selected_features)} features)...")
+    
+    # We call the factory AGAIN to get a FRESH iterator for Pass 2
+    pass2_iter = data_factory()
+    for chunk in pass2_iter:
         keep = [c for c in chunk.columns if c in selected_features or c in METADATA_COLS]
         yield chunk[keep]
+        
+    # Final cleanup
+    del variance_series
+    gc.collect()
 
 def h5_variance_filter_pipeline(h5_path, dataset_name='data', chunk_size=10000):
-    """
-    Two-pass memory-efficient pipeline for H5 files.
-    Pass 1: Calculate Variance
-    Pass 2: Yield filtered data
+    # This 'factory' can be called multiple times to get a new iterator
+    factory = lambda: h5_chunk_iterator(h5_path, dataset_name, chunk_size)
     
-    This is a convenience wrapper around variance_filter_pipeline for H5 files.
-    """
-    # Create iterator from H5 file
-    df_iter = h5_chunk_iterator(h5_path, dataset_name, chunk_size)
-    
-    # Use the general variance filter pipeline
-    yield from variance_filter_pipeline(df_iter)
+    yield from variance_filter_pipeline(factory)
 
 # --- Example Usage ---
 if __name__ == "__main__":
