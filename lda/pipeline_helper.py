@@ -172,13 +172,19 @@ def run_interactive_pipeline(data_factory, pipeline_configs, class_assignment_fu
             dr_params = DEFAULT_PARAMETERS['dimensionality_reduction'].get(dr_m, {}).copy()
             
             # This now includes the dynamic dimension safety check we discussed
-            dr_res = execute_dr_method(dr_m, fs_data, dr_params)
+            final_output = execute_dr_method(dr_m, fs_data, dr_params)
             
-            if dr_res is not None:
-                with open(cache_path, 'wb') as f:
-                    pickle.dump(dr_res, f)
-                final_results[name] = dr_res
-                print(f"✅ Saved: {cache_path}")
+            # Extract and display selected features
+            selected_features = extract_selected_features(fs_data)
+            print(f"Selected features ({len(selected_features)}): {selected_features[:10]}{'...' if len(selected_features) > 10 else ''}")
+            
+            final_results[name] = {
+                'success': True,
+                'data': final_output,
+                'config': config,
+                'selected_features': selected_features
+            }
+            print(f"Result: SUCCESS")
 
         except Exception as e:
             print(f"❌ Error in pipeline {name}: {e}")
@@ -188,7 +194,13 @@ def run_interactive_pipeline(data_factory, pipeline_configs, class_assignment_fu
             gc.collect()
 
     print("\n✨ All automated pipelines complete.")
-
+    
+    # Calculate evaluation metrics and create leaderboard
+    print("\n📊 CALCULATING EVALUATION METRICS...")
+    
+    # Use existing evaluation system
+    summarize_and_evaluate(final_results, variance_df)
+    
     return final_results, variance_df
 
 
@@ -253,6 +265,32 @@ def run_interactive_step_generic(name, cache_path, param_category, param_subcate
 # =============================================================================
 # EXECUTION DISPATCHERS
 # =============================================================================
+
+def extract_selected_features(fs_result):
+    """Extract selected feature names from different FS method result formats."""
+    if hasattr(fs_result, 'columns'):
+        # DataFrame result
+        feature_cols = [col for col in fs_result.columns if col not in ['construct', 'subconstruct', 'replica', 'frame_number', 'class']]
+        return feature_cols
+    elif isinstance(fs_result, dict):
+        # Dictionary result
+        if 'selected_features' in fs_result:
+            return fs_result['selected_features']
+        elif 'X_selected' in fs_result:
+            # If X_selected is a DataFrame, get column names
+            if hasattr(fs_result['X_selected'], 'columns'):
+                feature_cols = [col for col in fs_result['X_selected'].columns if col not in ['construct', 'subconstruct', 'replica', 'frame_number', 'class']]
+                return feature_cols
+            else:
+                # If it's an array, we can't get feature names easily
+                return [f"feature_{i}" for i in range(fs_result['X_selected'].shape[1])]
+        else:
+            return list(fs_result.keys())
+    elif hasattr(fs_result, '__len__'):
+        # List or similar
+        return list(fs_result)
+    else:
+        return ["Unknown format"]
 
 def execute_fs_method(method, factory, params):
     if method == 'bpso':
@@ -377,8 +415,18 @@ def create_interactive_pipeline_configs():
     
     return configs
 
-def evaluate_separability(df, target_col='class'):
-    features = [c for c in df.columns if c != target_col]
+def evaluate_separability(df, target_col='class', selected_features=None):
+    """Calculate Fisher separability score using only selected features."""
+    if selected_features is None:
+        # If no selected features specified, use all non-target columns
+        features = [c for c in df.columns if c != target_col]
+    else:
+        # Use only the selected features
+        features = [f for f in selected_features if f in df.columns]
+    
+    if not features:
+        return 0
+        
     X = df[features].values
     y = df[target_col].values
     
@@ -396,12 +444,19 @@ def evaluate_separability(df, target_col='class'):
     
     return sb / (sw + 1e-9)
 
-def get_feature_importance(original_df, transformed_df, target_col='class'):
-    """Maps original feature names back to the new LDs using Correlation."""
+def get_feature_importance(original_df, transformed_df, selected_features=None, target_col='class'):
+    """Maps selected original features back to new LDs using Correlation."""
     from data_access import METADATA_COLS
-    # Keep only numeric columns from the original data for correlation
-    original_numeric = original_df.select_dtypes(include=[np.number])
-    original_numeric = original_numeric.drop(columns=list(METADATA_COLS), errors='ignore')
+    
+    if selected_features is None:
+        # If no selected features specified, use all numeric features
+        original_numeric = original_df.select_dtypes(include=[np.number])
+        original_numeric = original_numeric.drop(columns=list(METADATA_COLS), errors='ignore')
+        features_to_correlate = original_numeric.columns.tolist()
+    else:
+        # Use only the selected features
+        features_to_correlate = [f for f in selected_features if f in original_df.columns]
+        original_numeric = original_df[features_to_correlate]
     
     ld_cols = [c for c in transformed_df.columns if c != target_col]
     loadings = {}
@@ -433,7 +488,11 @@ def summarize_and_evaluate(results, original_df, corr_threshold=0.5):
 
     scored_list = []
     for name, df in results.items():
-        score = evaluate_separability(df)
+        # Extract selected features from the pipeline result
+        selected_features = result.get('selected_features', [])
+        
+        # Calculate Fisher score using only selected features
+        score = evaluate_separability(df, selected_features=selected_features)
         scored_list.append({'name': name, 'score': score, 'df': df})
 
     scored_list.sort(key=lambda x: x['score'], reverse=True)
