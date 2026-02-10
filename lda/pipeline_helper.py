@@ -334,11 +334,22 @@ def run_interactive_pipeline(data_factory, pipeline_configs, class_assignment_fu
             selected_features = extract_selected_features(fs_data)
             print(f"Selected features ({len(selected_features)}): {selected_features[:10]}{'...' if len(selected_features) > 10 else ''}")
             
+            # Collect hyperparameters from both steps
+            fs_hyperparams = fs_data.get('hyperparameters', {}) if isinstance(fs_data, dict) else {}
+            dr_hyperparams = {
+                'category': 'dimensionality_reduction',
+                'subcategory': dr_m,
+                'parameters': dr_params.copy(),
+                'timestamp': pd.Timestamp.now().isoformat()
+            }
+            
             final_results[name] = {
                 'success': True,
                 'data': final_output,
                 'config': config,
-                'selected_features': selected_features
+                'selected_features': selected_features,
+                'feature_selection_hyperparameters': fs_hyperparams,
+                'dimensionality_reduction_hyperparameters': dr_hyperparams
             }
             
             # --- AUTO-SAVE Result ---
@@ -368,6 +379,25 @@ def run_interactive_pipeline(data_factory, pipeline_configs, class_assignment_fu
 # =============================================================================
 # GENERIC INTERACTIVE HELPER
 # =============================================================================
+
+def enhance_result_with_hyperparameters(result, params, category, subcategory):
+    """
+    Enhance a result object with hyperparameter information for tracking and reproducibility.
+    """
+    if isinstance(result, dict):
+        enhanced_result = result.copy()
+    else:
+        enhanced_result = {'data': result}
+    
+    # Add hyperparameter metadata
+    enhanced_result['hyperparameters'] = {
+        'category': category,
+        'subcategory': subcategory,
+        'parameters': params.copy(),
+        'timestamp': pd.Timestamp.now().isoformat()
+    }
+    
+    return enhanced_result
 
 def run_interactive_step_generic(name, cache_path, param_category, param_subcategory, execution_fn, preview_fn=None):
     """
@@ -407,8 +437,10 @@ def run_interactive_step_generic(name, cache_path, param_category, param_subcate
             accept = input(f"\nAccept {name} results? (y/N): ").strip().lower()
             if accept == 'y':
                 result = temp_result
+                # Enhance result with hyperparameters for tracking
+                enhanced_result = enhance_result_with_hyperparameters(result, params, param_category, param_subcategory)
                 with open(cache_path, 'wb') as f:
-                    pickle.dump(result, f)
+                    pickle.dump(enhanced_result, f)
                 print(f"Results accepted and cached to {cache_path}")
                 break
             else:
@@ -673,7 +705,222 @@ import pandas as pd
 from pathlib import Path
 import pickle
 
-def summarize_and_evaluate(results, original_df, corr_threshold=0.5):
+def plot_feature_distributions(original_df, transformed_df, pipeline_name, target_col='class', top_n=10):
+    """
+    Plot the distribution of top N important original features across different classes.
+    """
+    import plotly.express as px
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    import numpy as np
+    
+    # Get feature columns (exclude metadata)
+    feature_cols = [c for c in original_df.columns if c not in ['construct', 'subconstruct', 'replica', 'frame_number', 'class', 'time']]
+    
+    if not feature_cols:
+        print("      ↳ Warning: No feature columns available for distribution analysis.")
+        return
+    
+    # Calculate feature importance using correlation with classes
+    feature_importance = {}
+    for feat_col in feature_cols:
+        if feat_col in original_df.columns and pd.api.types.is_numeric_dtype(original_df[feat_col]):
+            # Calculate correlation with target classes (one-hot encoded)
+            classes = original_df[target_col].unique()
+            correlations = []
+            
+            for class_label in classes:
+                class_mask = original_df[target_col] == class_label
+                if class_mask.sum() > 1:
+                    feat_vals = original_df.loc[class_mask, feat_col]
+                    # Use variance as a measure of discriminative power
+                    if feat_vals.var() > 0:
+                        correlations.append(feat_vals.var())
+            
+            if correlations:
+                feature_importance[feat_col] = np.mean(correlations)
+    
+    # Get top N most important features
+    sorted_features = sorted(feature_importance.items(), key=lambda x: x[1], reverse=True)[:top_n]
+    
+    if not sorted_features:
+        print("      ↳ Warning: No important features found for distribution analysis.")
+        return
+    
+    top_features = [feat for feat, _ in sorted_features]
+    
+    # Create subplots for feature distributions
+    n_features = len(top_features)
+    cols = min(3, n_features)
+    rows = (n_features + cols - 1) // cols
+    
+    fig = make_subplots(
+        rows=rows, 
+        cols=cols,
+        subplot_titles=[f'Distribution of {feat}' for feat in top_features],
+        vertical_spacing=0.15,
+        horizontal_spacing=0.1
+    )
+    
+    colors = px.colors.qualitative.Set1
+    classes = original_df[target_col].unique()
+    
+    for i, feat in enumerate(top_features):
+        row = (i // cols) + 1
+        col = (i % cols) + 1
+        
+        for j, class_label in enumerate(classes):
+            class_data = original_df[original_df[target_col] == class_label][feat]
+            
+            if len(class_data) > 0:
+                fig.add_trace(
+                    go.Histogram(
+                        x=class_data,
+                        name=f'{class_label}' if i == 0 else f'{class_label}_{i}',
+                        opacity=0.7,
+                        marker_color=colors[j % len(colors)],
+                        legendgroup=f'class_{class_label}',
+                        showlegend=(i == 0)  # Only show legend for first subplot
+                    ),
+                    row=row, 
+                    col=col
+                )
+        
+        fig.update_xaxes(title_text=feat, row=row, col=col)
+        fig.update_yaxes(title_text="Count", row=row, col=col)
+    
+    fig.update_layout(
+        title=f"Feature Distributions by Class - Top {top_n} Features - {pipeline_name}",
+        height=300 * rows,
+        template="plotly_white",
+        showlegend=True,
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1
+        )
+    )
+    
+    fig.show()
+
+def plot_feature_contributions(original_df, transformed_df, pipeline_name, target_col='class', top_n=10):
+    """
+    Plot the contribution of each original feature to each latent dimension,
+    ranked from highest magnitude to lowest.
+    """
+    import plotly.express as px
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    import numpy as np
+    
+    ld_cols = [c for c in transformed_df.columns if c != target_col]
+    feature_cols = [c for c in original_df.columns if c not in ['construct', 'subconstruct', 'replica', 'frame_number', 'class', 'time']]
+    
+    if not ld_cols or not feature_cols:
+        print("      ↳ Warning: Insufficient data for feature contribution analysis.")
+        return
+    
+    # Calculate correlations between original features and latent dimensions
+    contributions = {}
+    for ld_col in ld_cols:
+        correlations = []
+        feature_names = []
+        
+        for feat_col in feature_cols:
+            if feat_col in original_df.columns:
+                # Use common indices to ensure alignment
+                common_idx = original_df.index.intersection(transformed_df.index)
+                if len(common_idx) > 1:
+                    orig_vals = original_df.loc[common_idx, feat_col]
+                    ld_vals = transformed_df.loc[common_idx, ld_col]
+                    
+                    # Calculate correlation (contribution strength)
+                    corr = np.corrcoef(orig_vals, ld_vals)[0, 1]
+                    if not np.isnan(corr):
+                        correlations.append(abs(corr))  # Use absolute value for magnitude
+                        feature_names.append(feat_col)
+        
+        # Sort by magnitude (descending)
+        sorted_indices = np.argsort(correlations)[::-1]
+        contributions[ld_col] = {
+            'features': [feature_names[i] for i in sorted_indices[:top_n]],
+            'magnitudes': [correlations[i] for i in sorted_indices[:top_n]]
+        }
+    
+    # Create subplots for each latent dimension
+    n_dims = len(ld_cols)
+    if n_dims == 0:
+        return
+    
+    cols = min(2, n_dims)
+    rows = (n_dims + cols - 1) // cols
+    
+    fig = make_subplots(
+        rows=rows, 
+        cols=cols,
+        subplot_titles=[f'{ld_col} - Top {top_n} Feature Contributions' for ld_col in ld_cols],
+        vertical_spacing=0.15
+    )
+    
+    colors = px.colors.qualitative.Set3
+    
+    for i, ld_col in enumerate(ld_cols):
+        row = (i // cols) + 1
+        col = (i % cols) + 1
+        
+        features = contributions[ld_col]['features']
+        magnitudes = contributions[ld_col]['magnitudes']
+        
+        fig.add_trace(
+            go.Bar(
+                x=magnitudes,
+                y=features,
+                orientation='h',
+                name=ld_col,
+                marker_color=colors[i % len(colors)],
+                showlegend=False
+            ),
+            row=row, 
+            col=col
+        )
+        
+        fig.update_xaxes(title_text="Contribution Magnitude", row=row, col=col)
+        fig.update_yaxes(title_text="Features", row=row, col=col)
+    
+    fig.update_layout(
+        title=f"Feature Contributions by Latent Dimension - {pipeline_name}",
+        height=400 * rows,
+        template="plotly_white",
+        showlegend=False
+    )
+    
+    fig.show()
+
+def display_hyperparameters(hyperparams, title="Hyperparameters"):
+    """
+    Display hyperparameters in a formatted way.
+    """
+    if not hyperparams:
+        return
+    
+    print(f"      🔧 {title}:")
+    if isinstance(hyperparams, dict):
+        category = hyperparams.get('category', 'Unknown')
+        subcategory = hyperparams.get('subcategory', 'Unknown')
+        params = hyperparams.get('parameters', {})
+        timestamp = hyperparams.get('timestamp', '')
+        
+        print(f"         Method: {category.upper()} ➔ {subcategory.upper()}")
+        if timestamp:
+            print(f"         Time: {timestamp}")
+        
+        for param_name, param_value in params.items():
+            print(f"         • {param_name}: {param_value}")
+    print()
+
+def summarize_and_evaluate(results, variance_df, original_df=None, corr_threshold=0.5):
     if not results:
         print("⚠️ No results available to evaluate.")
         return
@@ -728,6 +975,17 @@ def summarize_and_evaluate(results, original_df, corr_threshold=0.5):
         used_features = [f for f in used_features if f in original_df.columns and pd.api.types.is_numeric_dtype(original_df[f])]
         print(f"{rank:<5} | {name:<25} | {total_score:<12.4f} | {len(ld_cols)}")
         print(f"      📉 Selection Stats: {len(used_features)} numeric features available for mapping.")
+        
+        # Display hyperparameters if available
+        if isinstance(results[name], dict):
+            fs_hyperparams = results[name].get('feature_selection_hyperparameters')
+            dr_hyperparams = results[name].get('dimensionality_reduction_hyperparameters')
+            
+            if fs_hyperparams:
+                display_hyperparameters(fs_hyperparams, "Feature Selection Hyperparameters")
+            if dr_hyperparams:
+                display_hyperparameters(dr_hyperparams, "Dimensionality Reduction Hyperparameters")
+        
         sys.stdout.flush()
 
         try:
@@ -765,6 +1023,15 @@ def summarize_and_evaluate(results, original_df, corr_threshold=0.5):
             
         if rank <= 3:
             try:
+                # First, show feature contributions
+                print(f"      📊 Generating Feature Contributions Analysis...")
+                plot_feature_contributions(original_df, df, name, survivors=used_features)
+                
+                # Second, show feature distributions across classes
+                print(f"      📈 Generating Feature Distributions Analysis...")
+                plot_feature_distributions(original_df, df, name, survivors=used_features)
+                
+                # Third, show the standard visualizations
                 if len(ld_cols) >= 3:
                     visualize_cluster_biplot_3d(original_df, df, name, survivors=used_features)
                 elif len(ld_cols) == 2:
@@ -782,15 +1049,34 @@ def summarize_and_evaluate(results, original_df, corr_threshold=0.5):
 
 def visualize_cluster_1d(transformed_df, pipeline_name, target_col='class'):
     import plotly.express as px
-    ld_col = [c for c in transformed_df.columns if c != target_col][0]
+    import pandas as pd
+    import numpy as np
     
-    fig = px.strip(transformed_df, 
-                   x=ld_col, 
-                   y=target_col, 
-                   color=target_col,
-                   title=f"1D Distribution: {pipeline_name}",
-                   labels={ld_col: "Component 1"},
-                   template="plotly_white")
+    ld_cols = [c for c in transformed_df.columns if c != target_col]
+    
+    # Handle case where we might have 2D data but need 1D visualization
+    if len(ld_cols) == 1:
+        ld_col = ld_cols[0]
+        fig = px.strip(transformed_df, 
+                       x=ld_col, 
+                       y=target_col, 
+                       color=target_col,
+                       title=f"1D Distribution: {pipeline_name}",
+                       labels={ld_col: "Component 1"},
+                       template="plotly_white")
+    elif len(ld_cols) == 2:
+        # If we have 2D data, create a 1D visualization using the first component
+        ld_col = ld_cols[0]
+        fig = px.strip(transformed_df, 
+                       x=ld_col, 
+                       y=target_col, 
+                       color=target_col,
+                       title=f"1D Distribution (Component 1): {pipeline_name}",
+                       labels={ld_col: "Component 1"},
+                       template="plotly_white")
+    else:
+        print(f"Warning: Expected 1D data for 1D visualization, got {len(ld_cols)} dimensions")
+        return
     
     fig.update_layout(showlegend=False)
     fig.show()
