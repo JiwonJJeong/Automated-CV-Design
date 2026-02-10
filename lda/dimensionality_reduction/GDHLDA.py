@@ -18,7 +18,7 @@ def run_gdhlda(
     **kwargs
 ):
     # 1. Input Handling
-    df = pd.concat(data, ignore_index=True) if hasattr(data, '__iter__') and not isinstance(data, pd.DataFrame) else data.copy()
+    df = pd.concat(data, ignore_index=False) if hasattr(data, '__iter__') and not isinstance(data, pd.DataFrame) else data.copy()
     
     descriptor_list = [col for col in df.columns if col != target_col and col not in METADATA_COLS and pd.api.types.is_numeric_dtype(df[col])]
     X = df[descriptor_list].values.astype(np.float64)
@@ -61,6 +61,15 @@ def run_gdhlda(
     S_B_sum = sum(p['Bgh'] * p['weight'] for p in pairs)
     eig_vals, eig_vecs = np.linalg.eigh(S_B_sum) # Symmetric solver
     idx = np.argsort(np.abs(eig_vals))[::-1]
+    sorted_eig_vals = np.abs(eig_vals[idx])
+    
+    if num_eigenvector is None:
+        cumulative_variance = np.cumsum(sorted_eig_vals) / np.sum(sorted_eig_vals)
+        num_eigenvector = np.argmax(cumulative_variance >= 0.95) + 1
+        print(f"GDHLDA Dynamic selection: {num_eigenvector} components capture 95% between-class scatter")
+    else:
+        num_eigenvector = min(num_eigenvector, num_descriptor)
+
     W = eig_vecs[:, idx][:, :num_eigenvector].real
 
     # 4. Stabilized Gradient Descent
@@ -106,9 +115,12 @@ def run_gdhlda(
             W, _ = np.linalg.qr(W) # Fast re-orthogonalization
 
     # 6. Result Assembly
-    X_lda = X.dot(W)
-    result_df = pd.DataFrame(X_lda, columns=[f'LD{i+1}' for i in range(num_eigenvector)])
+    result_df = pd.DataFrame(X.dot(W), columns=[f'LD{i+1}' for i in range(num_eigenvector)], index=df.index)
     result_df[target_col] = df[target_col].values
+    
+    # Preserve metadata attributes (selected_features) for the leaderboard
+    if hasattr(df, 'attrs'):
+        result_df.attrs.update(df.attrs)
     
     if save_csv: result_df.to_csv(output_csv, index=False)
     return result_df

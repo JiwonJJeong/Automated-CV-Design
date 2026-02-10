@@ -30,7 +30,7 @@ def run_pca(
     # Handle iterator or single DataFrame
     if hasattr(data, '__iter__') and not isinstance(data, pd.DataFrame):
         # If it's an iterator, consume it into a single DataFrame
-        df = pd.concat(data, ignore_index=True)
+        df = pd.concat(data, ignore_index=False)
     else:
         df = data.copy()
     
@@ -63,38 +63,48 @@ def run_pca(
     y = df[target_col].values
 
     # Validate num_eigenvector against available features
-    max_possible_pc = min(num_descriptor, num_eigenvector)
-    if num_eigenvector > max_possible_pc:
-        print(f"Warning: Requested {num_eigenvector} PCs, but max is {max_possible_pc}. Adjusting.")
-        num_eigenvector = max_possible_pc
+    if num_eigenvector is None:
+        print("Dynamic dimensionality selection: target = 95% variance")
+        n_comp = 0.95
+        solver = 'full' # 'full' is required for variance-based n_components in sklearn
+    else:
+        max_possible_pc = min(num_descriptor, num_eigenvector)
+        if num_eigenvector > max_possible_pc:
+            print(f"Warning: Requested {num_eigenvector} PCs, but max is {max_possible_pc}. Adjusting.")
+            num_eigenvector = max_possible_pc
+        n_comp = num_eigenvector
+        solver = svd_solver
     
-    if num_eigenvector < 1:
+    if n_comp is not None and isinstance(n_comp, int) and n_comp < 1:
         raise ValueError("Cannot perform PCA: no features available.")
 
     ### STEP 3. Perform PCA
-    # Standard PCA does not accept max_iter or tol in __init__ 
-    # unless using specific solvers like 'arpack'
     pca_params = {
-        'n_components': num_eigenvector,
-        'svd_solver': svd_solver,
+        'n_components': n_comp,
+        'svd_solver': solver,
         'whiten': whiten
     }
     
     # Only add tol/max_iter if using the arpack solver
-    if svd_solver == 'arpack':
-        pca_params['tol'] = tols
+    if solver == 'arpack':
+        pca_params['tol'] = tol
         pca_params['max_iter'] = max_iter
 
     pca = PCA(**pca_params)
     pca_X = pca.fit_transform(X)
-    pca_X = pca.fit_transform(X)
+    
+    actual_n = pca_X.shape[1]
     print('Shape before PCA: ', X.shape)
-    print('Shape after PCA: ', pca_X.shape)
+    print(f'Shape after PCA: {pca_X.shape} (Captured {pca.explained_variance_ratio_.sum():.2%} variance)')
 
-    # Create result DataFrame with dynamic column names
-    cols = [f'PC{i+1}' for i in range(num_eigenvector)]
-    pca_df = pd.DataFrame(data=pca_X, columns=cols)
+    # Create result DataFrame with dynamic column names and PRESERVE INDEX
+    cols = [f'PC{i+1}' for i in range(actual_n)]
+    pca_df = pd.DataFrame(data=pca_X, columns=cols, index=df.index)
     pca_df['class'] = y
+
+    # Preserve metadata attributes (selected_features) for the leaderboard
+    if hasattr(df, 'attrs'):
+        pca_df.attrs.update(df.attrs)
     
     if save_csv:
         pca_df.to_csv(output_csv, index=False)

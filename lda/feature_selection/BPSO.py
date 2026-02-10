@@ -25,9 +25,9 @@ def compute_streaming_fisher(df_iterator, target_col, stride=1):
             chunk = chunk.iloc[::stride]
             
         if feature_cols is None:
-            # Explicitly exclude all metadata columns including 'time'
+            # Explicitly exclude metadata and the target column
             feature_cols = [c for c in get_feature_cols(chunk) 
-                           if c not in METADATA_COLS and pd.api.types.is_numeric_dtype(chunk[c])]
+                           if c != target_col and c not in METADATA_COLS and pd.api.types.is_numeric_dtype(chunk[c])]
         
         y = chunk[target_col].values
         X_chunk = chunk[feature_cols].values
@@ -149,14 +149,23 @@ class SVMFeatureSelection(Problem):
 # --- MAIN PIPELINE ---
 
 def run_bpso_pipeline(df_iterator_factory, target_col='class', candidate_limit=150, 
-                       seed=None, stride=5, population_size=None, **kwargs):
+                       seed=None, stride=5, population_size=None, knee_S=2.0, **kwargs):
     
     fisher_scores = compute_streaming_fisher(df_iterator_factory(), target_col, stride=stride)
     
     if fisher_scores.empty:
         return pd.DataFrame()
 
-    candidates = fisher_scores.index[:candidate_limit].tolist()
+    if candidate_limit is None:
+        from kneed import KneeLocator
+        y_vals = fisher_scores.values
+        # Using S=2.0 for feature selection to be slightly more conservative than variance filtering
+        kn = KneeLocator(range(len(y_vals)), y_vals, curve='convex', direction='decreasing', S=knee_S)
+        cutoff_idx = kn.knee if kn.knee is not None else min(150, len(y_vals))
+        candidates = fisher_scores.index[:cutoff_idx+1].tolist()
+        print(f"Dynamic candidate selection: Fisher score knee at index {cutoff_idx} ({len(candidates)} features)")
+    else:
+        candidates = fisher_scores.index[:candidate_limit].tolist()
     
     print(f"Pass 2: Loading {len(candidates)} features (stride={stride})...")
     data_list = []
@@ -173,7 +182,7 @@ def run_bpso_pipeline(df_iterator_factory, target_col='class', candidate_limit=1
         available = [c for c in cols_to_keep if c in chunk.columns]
         data_list.append(chunk[available])
     
-    narrow_df = pd.concat(data_list, ignore_index=True)
+    narrow_df = pd.concat(data_list, ignore_index=False)
     del data_list
     gc.collect()
 
@@ -184,9 +193,15 @@ def run_bpso_pipeline(df_iterator_factory, target_col='class', candidate_limit=1
     
     n_feats = X.shape[1]
     # Set a reasonable floor/ceiling for population and iterations for speed
-    pop = population_size if population_size else int(np.clip(n_feats * 0.3, 20, 60))
-    # We cap iterations to prevent "taking forever"
-    iters = int(np.clip(n_feats * 0.4, 15, 40))
+    # RESPECT Overrides from pipeline_helper (n_particles and max_iter)
+    pop = kwargs.get('n_particles', kwargs.get('population_size'))
+    if pop is None:
+        pop = int(np.clip(n_feats * 0.3, 20, 60))
+        
+    iters = kwargs.get('max_iter')
+    if iters is None:
+        # We cap iterations to prevent "taking forever"
+        iters = int(np.clip(n_feats * 0.4, 15, 40))
 
     problem = SVMFeatureSelection(X, y, cv=3)
     task = Task(problem, max_iters=iters)
@@ -203,13 +218,54 @@ def run_bpso_pipeline(df_iterator_factory, target_col='class', candidate_limit=1
     
     print(f"\n✅ Final selection: {len(final_features)} features.")
     
+    # --- STANDARDIZED VISUALIZATION ---
+    try:
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+        
+        fig, axes = plt.subplots(1, 3, figsize=(21, 6))
+        sns.set_theme(style="whitegrid")
+        
+        # 1. Signal Strength (Fisher Scree Plot)
+        y_vals = fisher_scores.values
+        axes[0].plot(range(len(y_vals)), y_vals, color='grey', alpha=0.5)
+        # Highlight selected features on the scree plot
+        selected_indices = [fisher_scores.index.get_loc(f) for f in final_features if f in fisher_scores.index]
+        axes[0].scatter(selected_indices, fisher_scores.iloc[selected_indices], color='red', s=40, label='BPSO Selected', zorder=5)
+        axes[0].set_title("Feature Signal Strength (Fisher)", fontsize=14)
+        axes[0].set_xlabel("Feature Rank")
+        axes[0].set_ylabel("Fisher Score")
+        axes[0].legend()
+        
+        # 2. Redundancy (Correlation Heatmap)
+        if len(final_features) > 1:
+            corr = narrow_df[final_features].corr()
+            sns.heatmap(corr, cmap="coolwarm", center=0, ax=axes[1], annot=False)
+            axes[1].set_title("Feature Redundancy (Correlation)", fontsize=14)
+        else:
+            axes[1].text(0.5, 0.5, "Need 2+ Features\nfor Heatmap", ha='center')
+            
+        # 3. State Space Mapping (2D Scatter)
+        if len(final_features) >= 2:
+            f1, f2 = final_features[0], final_features[1]
+            sample_df = narrow_df.sample(min(2000, len(narrow_df)))
+            sns.scatterplot(data=sample_df, x=f1, y=f2, hue=target_col, palette="deep", s=20, alpha=0.7, ax=axes[2])
+            axes[2].set_title(f"State Space Mapping\n{f1} vs {f2}", fontsize=14)
+        else:
+            axes[2].text(0.5, 0.5, "Need 2+ Features\nfor Scatter Plot", ha='center')
+            
+        plt.tight_layout()
+        plt.show()
+    except Exception as e:
+        print(f"Visualization failed: {e}")
+
     print(f"Pass 3: Recovering all rows for {len(final_features)} features...")
     full_data_list = []
     for chunk in df_iterator_factory():
         available = [c for c in (final_features + [target_col] + actual_metadata) if c in chunk.columns]
         full_data_list.append(chunk[available])
     
-    final_df = pd.concat(full_data_list, ignore_index=True)
+    final_df = pd.concat(full_data_list, ignore_index=False)
     del narrow_df
     gc.collect()
     

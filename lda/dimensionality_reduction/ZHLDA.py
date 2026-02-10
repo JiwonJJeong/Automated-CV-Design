@@ -19,7 +19,7 @@ def run_zhlda(
 ):
     # 1. Standardize Input
     if hasattr(data, '__iter__') and not isinstance(data, pd.DataFrame):
-        df = pd.concat(data, ignore_index=True)
+        df = pd.concat(data, ignore_index=False)
     else:
         df = data.copy()
 
@@ -70,8 +70,18 @@ def run_zhlda(
     S_B_sum = sum(p['Bgh'] * p['weight'] for p in pairs)
     
     # Use eigh for symmetric matrices - much more stable
-    eig_vals, eig_vecs = np.linalg.eigh(np.linalg.inv(S_W_reg).dot(S_B_sum))
+    # Note: inv(S_W_reg).dot(S_B_sum) is not necessarily symmetric, but its eigenvalues are real/positive
+    eig_vals, eig_vecs = np.linalg.eig(np.linalg.inv(S_W_reg).dot(S_B_sum))
     idx = np.argsort(np.abs(eig_vals))[::-1]
+    eig_vals_sorted = np.abs(eig_vals[idx])
+    
+    if num_eigenvector is None:
+        cumulative_variance = np.cumsum(eig_vals_sorted) / np.sum(eig_vals_sorted)
+        num_eigenvector = np.argmax(cumulative_variance >= 0.95) + 1
+        print(f"ZHLDA Dynamic selection: {num_eigenvector} components capture 95% generalized scatter")
+    else:
+        num_eigenvector = min(num_eigenvector, num_descriptor)
+
     W = eig_vecs[:, idx][:, :num_eigenvector].real
 
     # 5. Optimized Gradient Descent Loop
@@ -140,10 +150,12 @@ def run_zhlda(
             W, _ = np.linalg.qr(W)
 
     # 6. Final Assembly
-    X_transformed = X.dot(W)
-    cols = [f'LD{i+1}' for i in range(num_eigenvector)]
-    result_df = pd.DataFrame(X_transformed, columns=cols)
+    result_df = pd.DataFrame(X.dot(W), columns=[f'LD{i+1}' for i in range(num_eigenvector)], index=df.index)
     result_df[target_col] = df[target_col].values
+    
+    # Preserve metadata attributes (selected_features) for the leaderboard
+    if hasattr(df, 'attrs'):
+        result_df.attrs.update(df.attrs)
 
     if save_csv:
         result_df.to_csv(output_csv, index=False)

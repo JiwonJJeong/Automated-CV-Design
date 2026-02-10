@@ -8,6 +8,9 @@ import seaborn as sns
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 from kneed import KneeLocator
+from sklearn.mixture import GaussianMixture
+
+
 
 # 1. Path Setup (Maintaining your structure)
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -20,15 +23,15 @@ from data_access import create_dataframe_factory, get_feature_cols, METADATA_COL
 # VISUALIZATION: THE ELBOW PLOT
 # =============================================================================
 
-def plot_elbow_curve(k_range, inertias, optimal_k):
-    """Diagnostic plot to justify the number of clusters chosen."""
+def plot_bic_curve(k_range, bics, optimal_k):
+    """Diagnostic plot to justify the number of components chosen."""
     sns.set_theme(style="whitegrid")
     plt.figure(figsize=(10, 5))
-    plt.plot(k_range, inertias, marker='o', color='#2c3e50', lw=2)
-    plt.axvline(x=optimal_k, color='#e74c3c', linestyle='--', label=f'Optimal K: {optimal_k}')
-    plt.title("The Elbow Method: Finding the 'True' Number of States", fontsize=14)
-    plt.xlabel("Number of Clusters (k)")
-    plt.ylabel("Inertia (Within-Cluster Variance)")
+    plt.plot(k_range, bics, marker='o', color='#2c3e50', lw=2)
+    plt.axvline(x=optimal_k, color='#e74c3c', linestyle='--', label=f'Optimal K (Min BIC): {optimal_k}')
+    plt.title("GMM BIC Curve: Finding the Optimal Number of States", fontsize=14)
+    plt.xlabel("Number of Components (k)")
+    plt.ylabel("BIC Score (Lower is Better)")
     plt.legend()
     plt.tight_layout()
     plt.show()
@@ -38,60 +41,76 @@ def plot_elbow_curve(k_range, inertias, optimal_k):
 # =============================================================================
 
 def run_global_clustering_pipeline(df_iterator_factory, target_col='class', stride=5, 
-                                   max_k=15, show_plots=True):
+                                   max_k=15, S=1.0, show_plots=True):
     """
-    Finds shared states across all classes using K-Means and the Elbow Method.
+    Finds shared states across all classes using Gaussian Mixture Models and BIC.
     Assumes features are already reduced.
     """
     
     # --- Pass 1: Sampling for Model Fitting ---
-    print(f"Sampling dataset (stride={stride}) to find optimal cluster count...")
+    print(f"Sampling dataset (stride={stride}) to find optimal GMM components...")
     sample_list = []
     for chunk in df_iterator_factory():
         sample_list.append(chunk.iloc[::stride])
     
-    df_sample = pd.concat(sample_list, ignore_index=True)
+    df_sample = pd.concat(sample_list, ignore_index=False)
     # Get features excluding target and metadata
     feature_cols = [c for c in get_feature_cols(df_sample) if c != target_col]
     
-    # Scaling is mandatory for K-Means (distance-based)
+    # Scaling is mandatory for GMM
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(df_sample[feature_cols])
     
-    # --- Pass 2: The Elbow Search ---
-    print(f"Evaluating K from 2 to {max_k}...")
-    inertias = []
+    # --- Pass 2: The BIC Search ---
     k_range = range(2, max_k + 1)
-    
+    bics = []
     for k in k_range:
-        # n_init=auto for modern sklearn efficiency
-        km = KMeans(n_clusters=k, n_init='auto', random_state=42)
-        km.fit(X_scaled)
-        inertias.append(km.inertia_)
+        # Use higher reg_covar and max_iter for stability during search
+        gmm = GaussianMixture(
+            n_components=k, 
+            random_state=42, 
+            n_init=1, 
+            covariance_type='diag', 
+            reg_covar=1e-4,  # Increased for stability
+            max_iter=500,    # Increased
+            tol=1e-3         # Slightly relaxed to ensure convergence
+        )
+        gmm.fit(X_scaled)
+        bics.append(gmm.bic(X_scaled))
     
-    # Automatic detection of the 'elbow' point
-    kn = KneeLocator(k_range, inertias, curve='convex', direction='decreasing')
-    optimal_k = kn.knee if kn.knee is not None else 5
-    print(f"✅ Elbow detected at K = {optimal_k}")
+    # Optimal K Detection using KneeLocator on BIC curve
+    # BIC curves are typically 'convex' and 'decreasing' towards the minimum
+    kn = KneeLocator(list(k_range), bics, curve='convex', direction='decreasing', S=S)
+    optimal_k = kn.knee if kn.knee is not None else k_range[np.argmin(bics)]
+    
+    print(f"✅ BIC analysis complete. Optimal K (S={S}): {optimal_k}")
 
     if show_plots:
-        plot_elbow_curve(k_range, inertias, optimal_k)
+        plot_bic_curve(k_range, bics, optimal_k)
 
     # --- Pass 3: Final Global Fit ---
-    print(f"Fitting final K-Means with {optimal_k} clusters...")
-    final_kmeans = KMeans(n_clusters=optimal_k, n_init='auto', random_state=42)
-    final_kmeans.fit(X_scaled)
+    print(f"Fitting final GMM with {optimal_k} components...")
+    final_gmm = GaussianMixture(
+        n_components=optimal_k, 
+        random_state=42, 
+        n_init=10,           # Higher n_init for the final model
+        covariance_type='diag', 
+        reg_covar=1e-4, 
+        max_iter=1000,       # Maximum patience
+        tol=1e-4
+    )
+    final_gmm.fit(X_scaled)
 
     # --- Pass 4: Projection (Full Dataset) ---
-    print("Projecting cluster labels onto the full dataset...")
+    print("Assigning GMM state labels to the full dataset...")
     final_data_list = []
     
     for chunk in df_iterator_factory():
         # Apply the scaling learned from the sample
         X_chunk = scaler.transform(chunk[feature_cols])
         
-        # Predict which cluster each point belongs to
-        cluster_labels = final_kmeans.predict(X_chunk)
+        # Predict which component each point belongs to
+        cluster_labels = final_gmm.predict(X_chunk)
         
         # Append the new labels to the original dataframe
         chunk_res = chunk.copy()
@@ -100,13 +119,31 @@ def run_global_clustering_pipeline(df_iterator_factory, target_col='class', stri
         final_data_list.append(chunk_res)
     
     gc.collect() # Tidy up memory
-    return pd.concat(final_data_list, ignore_index=True)
+    result_df = pd.concat(final_data_list, ignore_index=False)
+    
+    # Preserve metadata attributes (selected_features, etc.)
+    # We pull attributes from df_sample which represents the input's metadata
+    if hasattr(df_sample, 'attrs'):
+        result_df.attrs.update(df_sample.attrs)
+        
+    return result_df
 
 def analyze_cluster_composition(df, target_col='class', cluster_col='global_cluster_id'):
     """Calculates and visualizes which classes make up each cluster."""
     
     # 1. Create a contingency table (Counts)
-    composition_counts = pd.crosstab(df[cluster_col], df[target_col])
+    if isinstance(target_col, str):
+        if target_col not in df.columns:
+            print(f"⚠️  Cannot analyze composition: '{target_col}' not found in results. Available: {df.columns.tolist()}")
+            return
+        target_values = df[target_col]
+        target_name = target_col
+    else:
+        # Handle case where target_col is a Series or array passed directly
+        target_values = target_col
+        target_name = "Refined Labels"
+        
+    composition_counts = pd.crosstab(df[cluster_col], target_values)
     
     # 2. Convert to percentages (Normalized by Cluster)
     # This tells you: "Of the points in Cluster 5, X% are Class 1"
@@ -115,14 +152,14 @@ def analyze_cluster_composition(df, target_col='class', cluster_col='global_clus
     print("\n--- Cluster Composition (%) ---")
     print(composition_perc.round(2))
 
-    # 3. Visualization: Stacked Bar Chart
+    # 3. Visualization: Stacked Bar Chart (Using Raw Counts)
     sns.set_theme(style="white")
-    composition_perc.plot(kind='bar', stacked=True, figsize=(10, 6), colormap='viridis')
+    composition_counts.plot(kind='bar', stacked=True, figsize=(10, 6), colormap='viridis')
     
-    plt.title("Cluster Composition by Class", fontsize=14)
+    plt.title("Cluster Population and Composition", fontsize=14)
     plt.xlabel("Global Cluster ID")
-    plt.ylabel("Percentage of Cluster")
-    plt.legend(title=target_col, bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.ylabel("Number of Points")
+    plt.legend(title=target_name, bbox_to_anchor=(1.05, 1), loc='upper left')
     plt.tight_layout()
     plt.show()
 

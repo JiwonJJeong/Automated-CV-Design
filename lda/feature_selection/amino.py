@@ -245,6 +245,10 @@ def find_ops(old_ops, max_outputs=20, bins=20, bandwidth=None, kernel='epanechni
     num_array = []
     op_dict = {}
 
+    if max_outputs is None:
+        print("AMINO: Dynamic feature selection enabled. Searching up to 40 clusters...")
+        max_outputs = 40
+
     while (max_outputs > 0):
         print(f"Checking {max_outputs} order parameters...")
         matrix = DissimilarityMatrix(max_outputs, mut)

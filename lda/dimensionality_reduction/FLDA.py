@@ -14,7 +14,7 @@ def run_flda(
     **kwargs
 ):
     # 1. Input Handling
-    df = pd.concat(data, ignore_index=True) if hasattr(data, '__iter__') and not isinstance(data, pd.DataFrame) else data.copy()
+    df = pd.concat(data, ignore_index=False) if hasattr(data, '__iter__') and not isinstance(data, pd.DataFrame) else data.copy()
     
     # 2. Extract Features
     descriptor_list = [
@@ -29,7 +29,8 @@ def run_flda(
 
     # 3. Validation
     max_possible_ld = min(n_features, len(unique_classes) - 1)
-    num_eigenvector = min(num_eigenvector, max_possible_ld)
+    if num_eigenvector is not None:
+        num_eigenvector = min(num_eigenvector, max_possible_ld)
 
     # --- SVD TRICK START ---
     # 4. Center the data
@@ -54,19 +55,25 @@ def run_flda(
     print(f"Performing SVD on {n_features} features...")
     
     # We solve the generalized problem using SVD on the combined matrices
-    # This is effectively what Scikit-Learn's LDA(solver='svd') does.
-    # It avoids calculating the N x N inverse.
-    _, _, V = linalg.svd(X_centered, full_matrices=False)
+    _, S_within, V = linalg.svd(X_centered, full_matrices=False)
     
     # Use the principal components of the within-class data to transform H_B
-    # This project the between-class variance into a more manageable space
     W = V.T  # This is our initial projection matrix
     
     # Further refine W based on between-class separation
-    # (Simplified for performance: taking the top eigenvectors of projected H_B)
     H_B_proj = H_B @ W
-    _, _, V_B = linalg.svd(H_B_proj, full_matrices=False)
+    _, S_between, V_B = linalg.svd(H_B_proj, full_matrices=False)
     
+    # --- Dynamic Selection based on 95% variance ---
+    # Using the squares of singular values as a proxy for eigenvalues (scatter)
+    eigenvalues = S_between**2
+    if num_eigenvector is None:
+        cumulative_variance = np.cumsum(eigenvalues) / np.sum(eigenvalues)
+        num_eigenvector = np.argmax(cumulative_variance >= 0.95) + 1
+        print(f"Dynamic dimensionality selection: {num_eigenvector} components capture 95% scatter variance")
+    else:
+        num_eigenvector = min(num_eigenvector, max_possible_ld)
+
     # Final Transformation Matrix
     W_final = W @ V_B.T
     W_final = W_final[:, :num_eigenvector]
@@ -76,8 +83,12 @@ def run_flda(
 
     # 7. Result Assembly
     cols = [f'LD{i+1}' for i in range(num_eigenvector)]
-    result_df = pd.DataFrame(X_lda, columns=cols)
+    result_df = pd.DataFrame(X_lda, columns=cols, index=df.index)
     result_df[target_col] = y
+    
+    # Preserve metadata attributes (selected_features) for the leaderboard
+    if hasattr(df, 'attrs'):
+        result_df.attrs.update(df.attrs)
     
     if save_csv:
         result_df.to_csv(output_csv, index=False)

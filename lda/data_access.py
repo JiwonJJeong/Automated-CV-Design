@@ -18,7 +18,10 @@ BASE_DIR = os.environ.get("DATA_BASE_DIR", DATA_BASE_DIR)
 DEFAULT_RESIDUE_LIST = list(range(144))  # Updated to 144 based on actual data
 
 # Standardized metadata columns that should be ignored by feature selection
-METADATA_COLS = {'construct', 'subconstruct', 'replica', 'frame_number', 'time'}
+METADATA_COLS = {
+    'construct', 'subconstruct', 'replica', 'frame_number', 'time',
+    'class', 'global_cluster_id', 'ground_truth'
+}
 
 # =============================================================================
 # FEATURE NAME GENERATION
@@ -134,29 +137,41 @@ def get_data_files(base_dir: str = BASE_DIR) -> List[Dict[str, str]]:
                 subconstruct = parts[1]
                 filename = parts[-1]
                 
-                # Extract replica from filename (e.g., "1_s0001_e0300_pairwise_dist.h5")
-                replica_str = filename.split("_")[0]
+                # Extract metadata from filename (e.g., "1_s0001_e0300_pairwise_dist.h5")
+                # Pattern: {replica}_s{start}_e{end}
+                filename_parts = filename.split("_")
+                replica_str = filename_parts[0]
                 
-                key = (construct, subconstruct, replica_str)
+                # Try to parse start/end frames if present
+                start_frame = 0
+                try:
+                    for p in filename_parts:
+                        if p.startswith('s') and p[1:].isdigit():
+                            start_frame = int(p[1:]) - 1 # 0-based for internal offset
+                            break
+                except:
+                    pass
+                
+                key = (construct, subconstruct, replica_str, start_frame)
                 
                 # If we already have an entry and the current one is .npy, skip it (prefer .h5)
                 if key in data_files_dict and data_file.suffix == '.npy':
                     continue
                 
-                # If current is .h5, it will overwrite any existing .npy entry for same key
                 data_files_dict[key] = {
                     "path": str(data_file),
                     "construct": construct,
                     "subconstruct": subconstruct,
                     "replica": replica_str,
+                    "start_frame": start_frame,
                     "type": data_file.suffix[1:]  # 'h5' or 'npy'
                 }
         except ValueError:
             continue
             
     data_files = list(data_files_dict.values())
-    # Sort files by (construct, subconstruct, replica_str)
-    data_files.sort(key=lambda x: (x["construct"], x["subconstruct"], x["replica"]))
+    # Sort files by (construct, subconstruct, replica_str, start_frame)
+    data_files.sort(key=lambda x: (x["construct"], x["subconstruct"], x["replica"], x["start_frame"]))
     return data_files
 
 def get_h5_info(h5_path: str) -> Dict[str, Dict[str, Union[Tuple, str, float]]]:
@@ -563,7 +578,11 @@ def _add_metadata_columns(df: pd.DataFrame, file_info: Dict[str, str],
                 _add_metadata_columns._time_warning_shown = True
             df['time'] = np.arange(len(df))
     
-    df['frame_number'] = np.arange(start_idx, end_idx) + 1
+    df['frame_number'] = np.arange(start_idx, end_idx) + 1 + file_info.get('start_frame', 0)
+    
+    # Set a unique index for alignment across pipeline phases
+    df.index = [f"rep{df['replica'].iloc[0]}_f{fn}" for fn in df['frame_number']]
+    
     return df
 
 # =============================================================================

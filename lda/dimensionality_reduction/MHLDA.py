@@ -13,7 +13,7 @@ def run_mhlda(
     **kwargs
 ):
     # 1. Handle Input
-    df = pd.concat(data, ignore_index=True) if hasattr(data, '__iter__') and not isinstance(data, pd.DataFrame) else data.copy()
+    df = pd.concat(data, ignore_index=False) if hasattr(data, '__iter__') and not isinstance(data, pd.DataFrame) else data.copy()
     
     # 2. Extract Numeric Features
     descriptor_list = [
@@ -64,6 +64,21 @@ def run_mhlda(
         
         # Sort descending
         idx = np.argsort(eig_vals)[::-1]
+        sorted_eig_vals = eig_vals[idx]
+        
+        # Dynamic selection based on 95% variance
+        if num_eigenvector is None:
+            # Positive eigenvalues only for variance calculation
+            valid_eig = sorted_eig_vals[sorted_eig_vals > 0]
+            if len(valid_eig) > 0:
+                cumulative_variance = np.cumsum(valid_eig) / np.sum(valid_eig)
+                num_eigenvector = np.argmax(cumulative_variance >= 0.95) + 1
+                print(f"MHLDA Dynamic selection: {num_eigenvector} components capture 95% generalized variance")
+            else:
+                num_eigenvector = 2
+        else:
+            num_eigenvector = min(num_eigenvector, n_features)
+
         W = eig_vecs[:, idx][:, :num_eigenvector].real
     except Exception as e:
         print(f"MHLDA Solver Error: {e}. Falling back to standard SVD.")
@@ -73,8 +88,12 @@ def run_mhlda(
 
     # 5. Project and Return
     X_lda = X @ W
-    result_df = pd.DataFrame(X_lda, columns=[f'LD{i+1}' for i in range(X_lda.shape[1])])
+    result_df = pd.DataFrame(X_lda, columns=[f'LD{i+1}' for i in range(X_lda.shape[1])], index=df.index)
     result_df[target_col] = y
+    
+    # Preserve metadata attributes (selected_features) for the leaderboard
+    if hasattr(df, 'attrs'):
+        result_df.attrs.update(df.attrs)
     
     if save_csv:
         result_df.to_csv(output_csv, index=False)

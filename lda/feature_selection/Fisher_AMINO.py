@@ -13,8 +13,12 @@ if script_dir not in sys.path:
     sys.path.insert(0, script_dir)
 
 try:
-    import amino
-    print("Successfully imported AMINO from:", amino.__file__)
+    try:
+        import amino_fast_mod as amino
+        print("Successfully imported Optimized AMINO (Parallel)")
+    except ImportError:
+        import amino
+        print("Successfully imported AMINO from:", amino.__file__)
 except ImportError as e:
     print(f"FAILED to find amino.py. Error: {e}")
     amino = None
@@ -38,8 +42,8 @@ def compute_sequential_fisher(df_iterator_factory, target_col):
     
     for chunk in df_iterator_factory():
         if feature_cols is None:
-            # Explicitly exclude all metadata columns including 'time'
-            feature_cols = [c for c in get_feature_cols(chunk) if c not in METADATA_COLS]
+            # Explicitly exclude all metadata columns and the target column
+            feature_cols = [c for c in get_feature_cols(chunk) if c != target_col and c not in METADATA_COLS]
         
         y = chunk[target_col].values
         current_chunk_classes = np.unique(y)
@@ -102,45 +106,61 @@ def extract_candidates_only(df_iterator_factory, target_col, candidates):
         for chunk in df_iterator_factory():
             # Identify which requested metadata actually exists in this chunk
             existing_meta = [c for c in potential_meta if c in chunk.columns]
-            # Build final column list for this chunk
-            cols_to_extract = [c for c in (candidates + [target_col] + existing_meta) if c in chunk.columns]
-            yield chunk[cols_to_extract]
+            # Build final column list for this chunk, removing duplicates
+            cols_to_extract = list(dict.fromkeys(candidates + [target_col] + existing_meta))
+            cols_available = [c for c in cols_to_extract if c in chunk.columns]
+            yield chunk[cols_available]
 
-    full_df = pd.concat(chunk_generator(), ignore_index=True)
+    full_df = pd.concat(chunk_generator(), ignore_index=False)
     gc.collect()
     return full_df
 
-def visualize_selection_process(fisher_series, candidate_df, final_features, target_col):
-    """
-    Diagnostic dashboard with safety checks for small feature sets.
-    """
-    fig, axes = plt.subplots(1, 3, figsize=(20, 6))
-    
-    # 1. Fisher Scree Plot
-    axes[0].plot(range(len(fisher_series)), fisher_series.values, color='grey', alpha=0.5)
-    top_n = min(15, len(fisher_series))
-    axes[0].scatter(range(top_n), fisher_series.values[:top_n], color='red', label='Top Candidates')
-    axes[0].set_title("Fisher Scores")
-    axes[0].legend()
+def visualize_amino_diagnostics(fisher_series, candidate_df, final_features, target_col):
+    """Standardized diagnostic dashboard for Feature Selection results."""
+    print("📊 Generating AMINO diagnostic plots...")
+    try:
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+        sns.set_theme(style="whitegrid")
+        fig, axes = plt.subplots(1, 3, figsize=(21, 6))
+        
+        # 1. Signal Strength (Fisher Scree Plot)
+        y_vals = fisher_series.values
+        axes[0].plot(range(len(y_vals)), y_vals, color='#333333', lw=1, alpha=0.5)
+        axes[0].fill_between(range(len(y_vals)), y_vals, color='#333333', alpha=0.1)
+        
+        # Highlight final AMINO selected features
+        if len(final_features) > 0:
+            selected_indices = [fisher_series.index.get_loc(f) for f in final_features if f in fisher_series.index]
+            axes[0].scatter(selected_indices, fisher_series.iloc[selected_indices], color='red', s=45, label='AMINO Selected', zorder=5)
+            axes[0].legend()
+            
+        axes[0].set_title("Feature Signal Strength (Fisher)", fontsize=14)
+        axes[0].set_xlabel("Feature Rank")
+        axes[0].set_ylabel("Fisher Score")
+        axes[0].set_yscale('log')
+        
+        # 2. Redundancy (Correlation Heatmap)
+        if len(final_features) > 1:
+            corr = candidate_df[final_features].corr()
+            sns.heatmap(corr, cmap="coolwarm", center=0, ax=axes[1], annot=False)
+            axes[1].set_title("Feature Redundancy (Correlation)", fontsize=14)
+        else:
+            axes[1].text(0.5, 0.5, "Need 2+ Features\nfor Heatmap", ha='center')
 
-    # 2. Redundancy Heatmap (Safety check for index length)
-    heatmap_n = min(10, len(fisher_series))
-    top_features = fisher_series.index[:heatmap_n]
-    corr = candidate_df[top_features].corr()
-    sns.heatmap(corr, annot=False, cmap='coolwarm', ax=axes[1])
-    axes[1].set_title(f"Correlation: Top {heatmap_n} Features")
-
-    # 3. State Space Separation
-    if len(final_features) >= 2:
-        sns.scatterplot(
-            data=candidate_df.sample(min(2000, len(candidate_df))), 
-            x=final_features[0], y=final_features[1], 
-            hue=target_col, ax=axes[2], s=15, alpha=0.6
-        )
-        axes[2].set_title("Final State Space Mapping")
-    
-    plt.tight_layout()
-    plt.show()
+        # 3. State Space Mapping (2D Scatter)
+        if len(final_features) >= 2:
+            f1, f2 = final_features[0], final_features[1]
+            sample_df = candidate_df.sample(min(2000, len(candidate_df)))
+            sns.scatterplot(data=sample_df, x=f1, y=f2, hue=target_col, palette="deep", s=20, alpha=0.7, ax=axes[2])
+            axes[2].set_title(f"State Space Mapping\n{f1} vs {f2}", fontsize=14)
+        else:
+            axes[2].text(0.5, 0.5, "Need 2+ Features\nfor Scatter Plot", ha='center')
+        
+        plt.tight_layout()
+        plt.show()
+    except Exception as e:
+        print(f"Visualization failed: {e}")
 
 def run_fisher_amino_pipeline(df_iterator_factory, target_col='class', max_outputs=5, knee_S=1.0):
     fisher_s = compute_sequential_fisher(df_iterator_factory, target_col)
@@ -162,9 +182,10 @@ def run_fisher_amino_pipeline(df_iterator_factory, target_col='class', max_outpu
         final_names = [getattr(op, 'name', str(op)) for op in final_ops]
     else:
         print("AMINO skipped (missing library or candidates). Keeping top candidates.")
-        final_names = candidate_features[:max_outputs]
+        limit = max_outputs if max_outputs is not None else 5
+        final_names = candidate_features[:limit]
 
-    visualize_selection_process(fisher_s, df_amino_input, final_names, target_col)
+    visualize_amino_diagnostics(fisher_s, df_amino_input, final_names, target_col)
 
     meta_present = [c for c in df_amino_input.columns if c in METADATA_COLS]
     final_columns = list(dict.fromkeys(final_names + [target_col] + meta_present))

@@ -474,8 +474,12 @@ def cluster(ops, seeds, mut):
         groups = grouping(old_centers, ops, mut)
 
         for i in range(len(groups)):
-            result = group_evaluation(groups[i], mut)
-            centers.append(result)
+            # Safety check for empty groups to prevent IndexError
+            if len(groups[i]) == 0:
+                centers.append(old_centers[i])
+            else:
+                result = group_evaluation(groups[i], mut)
+                centers.append(result)
 
     return centers
 
@@ -602,46 +606,18 @@ def num_clust(distortion_array, num_array):
         
     """
 
-    num_ops = 0
+    num_ops = 1 # Safety floor
     all_jumps = []
 
-    myfile1 = open('output1_distortion_jumps.txt', 'w')
-
-    for dim in range(1,11):
+    for dim in range(1, 11):
         neg_expo = np.array(distortion_array) ** (-0.5 * dim)
         jumps = []
         for i in range(len(neg_expo) - 1):
             jumps.append(neg_expo[i] - neg_expo[i + 1])
-        all_jumps.append(jumps)
-
-        print("DIM: %s, JUMPS: %s" % (dim,jumps[::-1]))
-        myfile1.write("%s %s\n" % (dim,jumps[::-1]))
-
-        min_index = 0
-        for i in range(len(jumps)):
-            if jumps[i] > jumps[min_index]:
-                min_index = i
-        if num_array[min_index] > num_ops:
-            num_ops = num_array[min_index]
-    
-    myfile1.close()
-    
-    num_ops = 0
-    all_jumps = []
-
-    for dim in range(1,11):
-        neg_expo = np.array(distortion_array) ** (-0.5 * dim)
-        jumps = []
-        for i in range(len(neg_expo) - 1):
-            jumps.append(neg_expo[i] - neg_expo[i + 1])
-        all_jumps.append(jumps)
-
-        print("DIM: %s, JUMPS: %s" % (dim,jumps[::-1]))
-
-        min_index = 0
-        for i in range(len(jumps)):
-            if jumps[i] > jumps[min_index]:
-                min_index = i
+        
+        if not jumps: continue
+        
+        min_index = np.argmax(jumps)
         if num_array[min_index] > num_ops:
             num_ops = num_array[min_index]
         
@@ -696,17 +672,24 @@ def find_ops(old_ops, max_outputs=20, bins=20, bandwidth=None, kernel='epanechni
     
     if kernel == 'parabolic':
         kernel = 'epanechnikov'
+    
+    if max_outputs is None:
+        print("AMINO: Dynamic feature selection enabled. Searching up to 40 clusters...")
+        max_outputs = 40
+        
     if bandwidth == None:
         bandwidth = set_bandwidth(old_ops, kernel, weights)
+
+    if bins == None:
+        bins = int(np.ceil(np.sqrt(len(old_ops[0].traj))))
+    else:
+        bins = int(bins)
 
     mut = Memoizer(bins, bandwidth, kernel, weights)
     distortion_array = []
     num_array = []
     op_dict = {}
 
-    if bins == None:
-        bins = np.ceil(np.sqrt(len(old_ops[0].traj)))
-        
     print('Calculating all pairwise distances...')
     full_matrix(old_ops, mut)
 
@@ -728,7 +711,15 @@ def find_ops(old_ops, max_outputs=20, bins=20, bandwidth=None, kernel='epanechni
     # Determining number of clusters
     num_ops = num_clust(distortion_array, num_array)
     
-    if return_memo:
-        return op_dict[num_ops], mut
+    # Safety check: ensure num_ops exists in dictionary
+    if num_ops not in op_dict:
+        num_ops = max(op_dict.keys())
 
-    return op_dict[num_ops]
+    # --- THE RETURN TYPE FIX ---
+    # Return strings, not objects, for DataFrame compatibility
+    final_names = [str(op.name) for op in op_dict[num_ops]]
+    
+    if return_memo:
+        return final_names, mut
+        
+    return final_names

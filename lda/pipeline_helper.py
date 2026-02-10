@@ -7,6 +7,8 @@ import numpy as np
 from pathlib import Path
 from typing import Dict, List, Callable, Any
 import gc
+import inspect
+from data_access import METADATA_COLS
 from feature_extraction.variance import variance_filter_pipeline
 
 # =============================================================================
@@ -15,75 +17,100 @@ from feature_extraction.variance import variance_filter_pipeline
 
 DEFAULT_PARAMETERS = {
     'variance': {
-        'show_plot': False,
-        'knee_S': 1.0,
-        'outlier_multiplier': 3.0,
-        'fallback_percentile': 90,
-        'min_clean_ratio': 0.5,
-        'plot_pause': 3.0
+        'show_plot': {'value': True, 'help': "Show variance plots for analysis"},
+        'knee_S': {'value': 1.0, 'help': "Knee detection sensitivity - higher = more features"},
+        'outlier_multiplier': {'value': 3.0, 'help': "Outlier detection threshold multiplier"},
+        'fallback_percentile': {'value': 90, 'help': "Fallback percentile for threshold"},
+        'min_clean_ratio': {'value': 0.5, 'help': "Min fraction of features to keep in 'clean' set before reverting to full data"}
     },
     'feature_selection': {
         'bpso': {
-            'n_particles': 30,
-            'max_iter': 100,
-            'w': 0.729,
-            'c1': 1.49445,
-            'c2': 1.49445
+            'candidate_limit': {'value': None, 'help': "Max features for optimization (None = Dynamic selection via Fisher Score Knee)"},
+            'knee_S': {'value': 2.0, 'help': "Sensitivity for the candidate filtering knee - higher = more features"},
+            'population_size': {'value': 20, 'help': "Swarm size - more particles = better exploration"},
+            'max_iter': {'value': 30, 'help': "Max iterations - higher = more optimization"},
+            'w': {'value': 0.729, 'help': "Inertia weight - controls exploration vs exploitation"},
+            'c1': {'value': 1.49445, 'help': "Cognitive parameter - individual learning influence"},
+            'c2': {'value': 1.49445, 'help': "Social parameter - swarm influence"},
+            'stride': {'value': 10, 'help': "Data sampling stride - higher = less data"}
         },
         'mpso': {
-            'population_size': 50,
-            'max_iter': 100,
-            'alpha': 0.9,
-            'threshold': 0.5
+            'dims': {'value': None, 'help': "Output dimensions (None = default 5)"},
+            'candidate_limit': {'value': None, 'help': "Max features for optimization (None = Dynamic selection via Fisher Score Knee)"},
+            'knee_S': {'value': 2.0, 'help': "Sensitivity for the candidate filtering knee - higher = more features"},
+            'max_iter': {'value': 10, 'help': "PSO iterations - higher = better optimization"},
+            'population_size': {'value': 40, 'help': "Swarm population size - larger = better search"},
+            'alpha': {'value': 0.9, 'help': "Accuracy-sparsity tradeoff - 0.0=accuracy, 1.0=sparsity"},
+            'threshold': {'value': 0.5, 'help': "Feature selection threshold - higher = fewer features"},
+            'redundancy_weight': {'value': 0.2, 'help': "Dimension independence penalty (0.0=none, 1.0=max redundancy reduction)"},
+            'stride': {'value': 15, 'help': "Data sampling stride - higher = less data"}
         },
         'fisher_amino': {
-            'max_outputs': 5,
-            'knee_S': 1.0
+            'max_outputs': {'value': None, 'help': "Target features (None = Dynamic selection via AMINO Distortion Jump method)"},
+            'knee_S': {'value': 2.0, 'help': "Sensitivity for the initial Fisher candidate knee - higher = more features"}
         },
         'chi_sq_amino': {
-            'stride': 5,
-            'max_amino': 10,
-            'q_bins': 5,
-            'sample_rows': 20000,
-            'knee_S': 5.0
+            'stride': {'value': 25, 'help': "Data sampling stride - higher = less memory usage"},
+            'max_amino': {'value': None, 'help': "Target features (None = Dynamic selection via AMINO Distortion Jump method)"},
+            'q_bins': {'value': 5, 'help': "Quantile bins for chi-square - higher = more resolution"},
+            'sample_rows': {'value': 20000, 'help': "Sample size for binning - higher = more accurate bins"},
+            'knee_S': {'value': 5.0, 'help': "Sensitivity for the initial Chi-Square candidate knee - higher = more features"}
         }
     },
     'dimensionality_reduction': {
         'flda': {
-            'num_eigenvector': 2,
-            'regularization': 1e-6
+            'num_eigenvector': {'value': None, 'help': "Output dimensions (None = dynamic 95% variance)"},
+            'regularization': {'value': 1e-6, 'help': "L1 regularization - prevents overfitting"}
         },
         'pca': {
-            'num_eigenvector': 2,
-            'svd_solver': 'auto'
+            'num_eigenvector': {'value': None, 'help': "Output dimensions (None = dynamic 95% variance)"},
+            'svd_solver': {'value': 'auto', 'help': "SVD algorithm - 'auto' recommended"}
         },
         'zhlda': {
-            'num_eigenvector': 2,
-            'learning_rate': 0.0001,
-            'num_iteration': 2000,
-            'stop_crit': 50,
-            'convergence_threshold': 1e-6
+            'num_eigenvector': {'value': None, 'help': "Output dimensions (None = dynamic 95% variance)"},
+            'learning_rate': {'value': 0.0001, 'help': "Gradient descent step size"},
+            'num_iteration': {'value': 1000, 'help': "Max iterations - higher = better convergence"},
+            'stop_crit': {'value': 30, 'help': "Convergence patience - prevents early stopping"},
+            'convergence_threshold': {'value': 1e-5, 'help': "Convergence tolerance - smaller = more precise"}
         },
         'mhlda': {
-            'num_eigenvector': 2,
-            'regularization': 1e-4,
-            'learning_rate': 0.0001,
-            'num_iteration': 2000,
-            'stop_crit': 50,
-            'convergence_threshold': 1e-6
+            'num_eigenvector': {'value': None, 'help': "Output dimensions (None = dynamic 95% variance)"},
+            'regularization': {'value': 1e-4, 'help': "L1 regularization - prevents overfitting"},
+            'learning_rate': {'value': 0.0001, 'help': "Gradient descent step size"},
+            'num_iteration': {'value': 1000, 'help': "Max iterations - higher = better convergence"},
+            'stop_crit': {'value': 30, 'help': "Convergence patience - prevents early stopping"},
+            'convergence_threshold': {'value': 1e-5, 'help': "Convergence tolerance - smaller = more precise"}
         },
         'gdhlda': {
-            'num_eigenvector': 2,
-            'learning_rate': 0.0001,
-            'num_iteration': 2000,
-            'stop_crit': 50,
-            'convergence_threshold': 1e-6
+            'num_eigenvector': {'value': None, 'help': "Output dimensions (None = dynamic 95% variance)"},
+            'learning_rate': {'value': 0.0001, 'help': "Gradient descent step size"},
+            'num_iteration': {'value': 1000, 'help': "Max iterations - higher = better convergence"},
+            'stop_crit': {'value': 30, 'help': "Convergence patience - prevents early stopping"},
+            'convergence_threshold': {'value': 1e-5, 'help': "Convergence tolerance - smaller = more precise"}
         }
     },
     'clustering': {
-        'stride': 5,
-        'max_k': 15,
-        'show_plots': True
+        'gmm': {
+            'stride': {'value': 10, 'help': "Data sampling stride - higher = faster but less precise"},
+            'max_k': {'value': 15, 'help': "Maximum clusters to test - higher = more options"},
+            'S': {'value': 1.0, 'help': "Knee sensitivity - higher = more clusters, lower = fewer"},
+            'show_plots': {'value': True, 'help': "Show BIC diagnostics plot"}
+        },
+        'spectral': {
+            'stride': {'value': 10, 'help': "Data sampling stride - higher = faster but less precise"},
+            'max_k': {'value': 15, 'help': "Maximum clusters to test - higher = more options"},
+            'n_components': {'value': 50, 'help': "Spectral embedding dimensions - higher = more complex"},
+            'S': {'value': 1.0, 'help': "Knee sensitivity - higher = more clusters, lower = fewer"},
+            'show_plots': {'value': True, 'help': "Show Elbow diagnostics plot"}
+        },
+        'tica': {
+            'stride': {'value': 10, 'help': "Data sampling stride - higher = faster but less precise"},
+            'lag_time': {'value': 10, 'help': "TICA lag time - higher = slower kinetic processes"},
+            'max_components': {'value': 5, 'help': "Max TICA components to evaluate"},
+            'max_k': {'value': 15, 'help': "Maximum clusters to test - higher = more options"},
+            'S': {'value': 1.0, 'help': "Knee sensitivity - higher = more clusters, lower = fewer"},
+            'show_plots': {'value': True, 'help': "Show TICA landscape plot"}
+        }
     }
 }
 
@@ -94,21 +121,56 @@ DEFAULT_PARAMETERS = {
 def get_params_minimal(category: str, subcategory: str = None) -> Dict[str, Any]:
     """Displays only hyperparameters and returns user modifications."""
     if subcategory:
-        defaults = DEFAULT_PARAMETERS[category][subcategory]
+        defaults_struct = DEFAULT_PARAMETERS[category][subcategory]
         header = f"[{category.upper()} : {subcategory.upper()}]"
+        
+        print(f"\n{header}")
+        print("📋 Parameter Controls:")
+        if category == 'feature_selection':
+            descriptions = {
+                'bpso': "Binary PSO - swarm intelligence for feature selection",
+                'mpso': "Multi-objective PSO - balances accuracy vs sparsity", 
+                'fisher_amino': "Fisher scoring with AMINO dimensionality reduction",
+                'chi_sq_amino': "Chi-square selection with AMINO reduction"
+            }
+            if subcategory in descriptions:
+                print(f"  🔬 Method: {descriptions[subcategory]}")
+        elif category == 'dimensionality_reduction':
+            descriptions = {
+                'flda': "Fisher Linear Discriminant Analysis",
+                'pca': "Principal Component Analysis", 
+                'zhlda': "Zero-order Hamiltonian LDA",
+                'mhlda': "Modified Hamiltonian LDA",
+                'gdhlda': "Gradient Descent Hamiltonian LDA"
+            }
+            if subcategory in descriptions:
+                print(f"  📊 Method: {descriptions[subcategory]}")
+        elif category == 'clustering':
+            descriptions = {
+                'gmm': "Gaussian Mixture Model (with BIC visualization)",
+                'spectral': "Spectral Clustering (Nystroem + K-means)",
+                'tica': "Time-lagged ICA (Kinetic landscape mapping)"
+            }
+            if subcategory in descriptions:
+                print(f"  🎯 Method: {descriptions[subcategory]}")
     else:
-        defaults = DEFAULT_PARAMETERS[category]
+        defaults_struct = DEFAULT_PARAMETERS[category]
         header = f"[{category.upper()}]"
+        print(f"\n{header}")
+        
+    print("⚙️  Hyperparameters:")
+    params = {}
+    for k, info in defaults_struct.items():
+        v = info['value']
+        blurb = info['help']
+        print(f"  {k}: {v} - {blurb}")
+        params[k] = v
 
-    print(f"\n{header}")
-    for k, v in defaults.items():
-        print(f"  {k}: {v}")
-
-    params = defaults.copy()
     modify = input("\nModify? (y/N): ").strip().lower()
     
     if modify == 'y':
-        for k, v in defaults.items():
+        for k, info in defaults_struct.items():
+            v = info['value']
             user_val = input(f"  {k} [{v}]: ").strip()
             if user_val:
                 try:
@@ -121,14 +183,13 @@ def get_params_minimal(category: str, subcategory: str = None) -> Dict[str, Any]
     return params
 
 # =============================================================================
-# CORE PIPELINE ENGINE
-# =============================================================================
-
-# ... (Keep Imports and DEFAULT_PARAMETERS as they are) ...
-
-# =============================================================================
 # CORE PIPELINE ENGINE (AUTOMATED DR PHASE)
 # =============================================================================
+
+def flatten_defaults(nested_dict):
+    """Flattens {'parm': {'value': val, 'help': ...}} into {'parm': val}"""
+    return {k: v['value'] if isinstance(v, dict) and 'value' in v else v 
+            for k, v in nested_dict.items()}
 
 def run_interactive_pipeline(data_factory, pipeline_configs, class_assignment_func=None):
     cache_dir = Path("pipeline_cache")
@@ -143,7 +204,7 @@ def run_interactive_pipeline(data_factory, pipeline_configs, class_assignment_fu
     variance_cache_path = cache_dir / "variance.pkl"
     def variance_exec(params):
         variance_result_gen = variance_filter_pipeline(data_factory, **params)
-        return list(variance_result_gen)[0]
+        return pd.concat(list(variance_result_gen), ignore_index=False)
     
     variance_df = run_interactive_step_generic("VARIANCE", variance_cache_path, 'variance', None, variance_exec)
     print(f"Variance Output: {variance_df.shape}")
@@ -152,32 +213,65 @@ def run_interactive_pipeline(data_factory, pipeline_configs, class_assignment_fu
     print("\n" + "="*30 + "\nCLASS ASSIGNMENT\n" + "="*30)
     print("Choose class assignment method:")
     print("1. Default: construct + subconstruct")
-    print("2. Clustering: K-means on variance-filtered features")
+    print("2. GMM: Gaussian Mixture Model (shared states)")
+    print("3. Spectral: Non-linear spectral clustering")
+    print("4. TICA: Kinetic landscape state assignment")
     
-    choice = input("Enter choice (1/2): ").strip()
+    choice = input("Enter choice (1-4): ").strip()
     
-    if choice == '2':
-        # Use clustering-based class assignment
-        from cluster.gmm import run_global_clustering_pipeline
-        
-        print("\nRunning clustering for class assignment...")
-        # Get clustering parameters interactively
-        cluster_params = get_params_minimal('clustering')
-        
+    if choice in ['2', '3', '4']:
         # Create factory from variance data
         def variance_factory():
             yield variance_df
-        
-        # Run clustering pipeline with user parameters
-        clustered_df = run_global_clustering_pipeline(variance_factory, target_col='class', **cluster_params)
+            
+        if choice == '2':
+            from cluster.gmm import run_global_clustering_pipeline
+            cluster_params = get_params_minimal('clustering', 'gmm')
+            clustered_df = run_global_clustering_pipeline(variance_factory, target_col='construct', **cluster_params)
+            method_name = "GMM"
+            
+        elif choice == '3':
+            from cluster.spectral import run_spectral_clustering_pipeline
+            cluster_params = get_params_minimal('clustering', 'spectral')
+            # Disable internal plot to show high-res one from helper
+            cluster_params['show_plots'] = False
+            clustered_df = run_spectral_clustering_pipeline(variance_factory, target_col='construct', **cluster_params)
+            method_name = "Spectral"
+            
+        elif choice == '4':
+            try:
+                from cluster.tica import run_validated_tica_pipeline
+                cluster_params = get_params_minimal('clustering', 'tica')
+                # Disable internal plot to show high-res one from helper
+                cluster_params['show_plots'] = False
+                clustered_df = run_validated_tica_pipeline(variance_factory, target_col='construct', **cluster_params)
+                method_name = "TICA"
+            except ImportError as e:
+                # ...
+                if 'deeptime' in str(e):
+                    print("\n❌ Error: 'deeptime' package is required for TICA but not found.")
+                    print("Please install it with: pip install deeptime")
+                    return None, None
+                else:
+                    raise e
         
         # Add cluster labels as class column
         variance_df['class'] = 'cluster_' + clustered_df['global_cluster_id'].astype(str)
-        print(f"Assigned {clustered_df['global_cluster_id'].nunique()} cluster-based classes")
+        print(f"Assigned {clustered_df['global_cluster_id'].nunique()} {method_name}-based classes")
         
-        # Show cluster composition
-        from cluster.gmm import analyze_cluster_composition
-        analyze_cluster_composition(clustered_df, target_col='class', cluster_col='global_cluster_id')
+        if choice == '2':
+            from cluster.gmm import analyze_cluster_composition
+            # High-res labels on-the-fly
+            refined_labels = clustered_df['construct'] + ' | ' + clustered_df['subconstruct']
+            analyze_cluster_composition(clustered_df, target_col=refined_labels, cluster_col='global_cluster_id')
+        elif choice == '3':
+            from cluster.spectral import analyze_cluster_composition
+            refined_labels = clustered_df['construct'] + ' | ' + clustered_df['subconstruct']
+            analyze_cluster_composition(clustered_df, target_col=refined_labels, cluster_col='global_cluster_id')
+        elif choice == '4':
+            from cluster.tica import analyze_cluster_composition
+            refined_labels = clustered_df['construct'] + ' | ' + clustered_df['subconstruct']
+            analyze_cluster_composition(clustered_df, target_col=refined_labels, cluster_col='global_cluster_id')
         
     else:
         # Default class assignment
@@ -231,7 +325,7 @@ def run_interactive_pipeline(data_factory, pipeline_configs, class_assignment_fu
             with open(fs_paths[fs_m], 'rb') as f:
                 fs_data = pickle.load(f)
 
-            dr_params = DEFAULT_PARAMETERS['dimensionality_reduction'].get(dr_m, {}).copy()
+            dr_params = flatten_defaults(DEFAULT_PARAMETERS['dimensionality_reduction'].get(dr_m, {}))
             
             # This now includes the dynamic dimension safety check we discussed
             final_output = execute_dr_method(dr_m, fs_data, dr_params)
@@ -246,7 +340,12 @@ def run_interactive_pipeline(data_factory, pipeline_configs, class_assignment_fu
                 'config': config,
                 'selected_features': selected_features
             }
-            print(f"Result: SUCCESS")
+            
+            # --- AUTO-SAVE Result ---
+            with open(cache_path, 'wb') as f:
+                pickle.dump(final_results[name], f)
+                
+            print(f"Result: SUCCESS (Saved to {cache_path.name})")
 
         except Exception as e:
             print(f"❌ Error in pipeline {name}: {e}")
@@ -330,24 +429,25 @@ def run_interactive_step_generic(name, cache_path, param_category, param_subcate
 
 def extract_selected_features(fs_result):
     """Extract selected feature names from different FS method result formats."""
+    # Logic: Favor explicit attrs, then columns, then dict keys
+    if hasattr(fs_result, 'attrs') and 'selected_features' in fs_result.attrs:
+        return fs_result.attrs['selected_features']
+    
     if hasattr(fs_result, 'columns'):
-        # DataFrame result
-        feature_cols = [col for col in fs_result.columns if col not in ['construct', 'subconstruct', 'replica', 'frame_number', 'class']]
-        return feature_cols
-    elif isinstance(fs_result, dict):
-        # Dictionary result
+        exclude = ['class', 'target'] + list(METADATA_COLS)
+        return [col for col in fs_result.columns if col not in exclude]
+    
+    if isinstance(fs_result, dict):
         if 'selected_features' in fs_result:
             return fs_result['selected_features']
-        elif 'X_selected' in fs_result:
-            # If X_selected is a DataFrame, get column names
+        if 'data' in fs_result and hasattr(fs_result['data'], 'attrs') and 'selected_features' in fs_result['data'].attrs:
+            return fs_result['data'].attrs['selected_features']
+        if 'X_selected' in fs_result:
             if hasattr(fs_result['X_selected'], 'columns'):
-                feature_cols = [col for col in fs_result['X_selected'].columns if col not in ['construct', 'subconstruct', 'replica', 'frame_number', 'class']]
-                return feature_cols
-            else:
-                # If it's an array, we can't get feature names easily
-                return [f"feature_{i}" for i in range(fs_result['X_selected'].shape[1])]
-        else:
-            return list(fs_result.keys())
+                exclude = ['class', 'target'] + list(METADATA_COLS)
+                return [col for col in fs_result['X_selected'].columns if col not in exclude]
+            return [f"feature_{i}" for i in range(fs_result['X_selected'].shape[1])]
+        return list(fs_result.keys())
     elif hasattr(fs_result, '__len__'):
         # List or similar
         return list(fs_result)
@@ -369,20 +469,15 @@ def execute_fs_method(method, factory, params):
         return run_feature_selection_pipeline(factory, **params)
     raise ValueError(f"Unknown FS: {method}")
 
-import inspect
-import inspect
-import pandas as pd
-import numpy as np
-
-import inspect
-import pandas as pd
-import numpy as np
-
 def execute_dr_method(method, fs_result, params):
     """
     Executes dimensionality reduction with dynamic dimension capping.
-    Fixes the concatenation error by ensuring METADATA_COLS is treated as a list.
     """
+    # fs_result is now back to being a DataFrame (MPSO metadata move to .attrs)
+    # Ensure it's treated correctly as a DataFrame
+    if isinstance(fs_result, dict) and 'X_selected' in fs_result:
+        fs_result = fs_result['X_selected']
+
     dr_registry = {
         'flda':   ('dimensionality_reduction.FLDA', 'run_flda'),
         'pca':    ('dimensionality_reduction.PCA', 'run_pca'),
@@ -402,7 +497,8 @@ def execute_dr_method(method, fs_result, params):
 
     # 2. Strict Feature Count Calculation
     from data_access import METADATA_COLS
-    # FIX: Convert METADATA_COLS to a list before concatenating
+    
+    # Target and metadata columns should not be used in DR
     exclude_cols = ['class', 'target'] + list(METADATA_COLS)
     
     numeric_cols = [
@@ -421,16 +517,28 @@ def execute_dr_method(method, fs_result, params):
         # For LDA methods (zhlda, gdhlda, flda, mhlda)
         limit = max_theoretical_dims
 
-    requested_dim = params.get('num_eigenvector', params.get('n_components', 2))
+    # Handle parameters that might still be in {'value': X, 'help': Y} format
+    def get_val(p_dict, key, default):
+        raw = p_dict.get(key, default)
+        if isinstance(raw, dict) and 'value' in raw:
+            return raw['value']
+        return raw
 
-    if requested_dim > limit:
-        if limit < 1:
-            print(f"🛑 Error: {method_str} cannot run. Only {actual_feat_count} features available.")
-            return None
-        
-        print(f"⚠️  Cap: {method_str} output reduced from {requested_dim} to {limit}")
-        params['num_eigenvector'] = limit
-        params['n_components'] = limit
+    requested_dim = get_val(params, 'num_eigenvector', get_val(params, 'n_components', 2))
+
+    # Capping Logic: Only apply if a specific integer was requested
+    if requested_dim is not None:
+        if requested_dim > limit:
+            if limit < 1:
+                print(f"🛑 Error: {method_str} cannot run. Only {actual_feat_count} features available.")
+                return None
+            
+            print(f"⚠️  Cap: {method_str} output reduced from {requested_dim} to {limit}")
+            requested_dim = limit
+
+    # Update params with the resolved value (could be int or None)
+    params['num_eigenvector'] = requested_dim
+    params['n_components'] = requested_dim
 
     # 4. Parameter Mapping & Signature Filtering
     if 'num_eigenvector' in params: params['n_components'] = params['num_eigenvector']
@@ -477,34 +585,61 @@ def create_interactive_pipeline_configs():
     
     return configs
 
-def evaluate_separability(df, target_col='class', selected_features=None):
-    """Calculate Fisher separability score using only selected features."""
+def evaluate_separability(df, target_col='class', selected_features=None, return_individual=False):
+    """
+    Calculate Fisher separability score (SB/SW ratio).
+    SB: Between-class scatter (how far apart class means are)
+    SW: Within-class scatter (how tight the clusters are)
+    """
+    from data_access import METADATA_COLS
+    
     if selected_features is None:
-        # If no selected features specified, use all non-target columns
-        features = [c for c in df.columns if c != target_col]
+        # Auto-detect numeric features, excluding metadata
+        exclude = [target_col, 'target'] + list(METADATA_COLS)
+        features = [c for c in df.columns if c not in exclude and pd.api.types.is_numeric_dtype(df[c])]
     else:
-        # Use only the selected features
+        # Use only the selected features that are actually present
         features = [f for f in selected_features if f in df.columns]
     
     if not features:
-        return 0
+        return {} if return_individual else 0
         
-    X = df[features].values
     y = df[target_col].values
+    unique_y = np.unique(y)
+    overall_mean = df[features].mean(axis=0).values
     
-    overall_mean = np.mean(X, axis=0)
-    sb = 0
-    sw = 0
+    # Pre-calculate class statistics for speed
+    class_data = {}
+    for cls in unique_y:
+        df_c = df[df[target_col] == cls][features]
+        class_data[cls] = {
+            'n': len(df_c),
+            'mean': df_c.mean(axis=0).values,
+            'var_sum': ((df_c - df_c.mean(axis=0))**2).sum(axis=0).values
+        }
     
-    for cls in np.unique(y):
-        X_c = X[y == cls]
-        mean_c = np.mean(X_c, axis=0)
-        # Between-class variance
-        sb += len(X_c) * np.sum((mean_c - overall_mean)**2)
-        # Within-class variance
-        sw += np.sum((X_c - mean_c)**2)
+    individual_scores = {}
+    total_sb = 0
+    total_sw = 0
     
-    return sb / (sw + 1e-9)
+    for i, feat in enumerate(features):
+        sb_feat = 0
+        sw_feat = 0
+        for cls in unique_y:
+            stats = class_data[cls]
+            sb_feat += stats['n'] * (stats['mean'][i] - overall_mean[i])**2
+            sw_feat += stats['var_sum'][i]
+        
+        individual_scores[feat] = sb_feat / (sw_feat + 1e-9)
+        total_sb += sb_feat
+        total_sw += sw_feat
+    
+    if return_individual:
+        return individual_scores
+    
+    # Revert to Pooled Ratio (Total SB / Total SW) for the aggregate score
+    # to maintain consistency with historical results.
+    return total_sb / (total_sw + 1e-9)
 
 def get_feature_importance(original_df, transformed_df, selected_features=None, target_col='class'):
     """Maps selected original features back to new LDs using Correlation."""
@@ -549,67 +684,116 @@ def summarize_and_evaluate(results, original_df, corr_threshold=0.5):
     print("-" * 100)
 
     scored_list = []
-    for name, df in results.items():
-        # Extract selected features from the pipeline result
-        # Get the pipeline result data from final_results
-        pipeline_result = final_results[name]
-        selected_features = pipeline_result.get('selected_features', [])
-        
-        # Calculate Fisher score using only selected features
-        score = evaluate_separability(df, selected_features=selected_features)
-        scored_list.append({'name': name, 'score': score, 'df': df})
+    for name, res in results.items():
+        # Handle both Dict (pipeline result) and raw DataFrame (old cache)
+        if isinstance(res, dict) and 'data' in res:
+            df = res['data']
+            # Recover features from the dict or the dataframe attributes (MPSO)
+            selected_features = res.get('selected_features', [])
+            if not selected_features and hasattr(df, 'attrs') and 'selected_features' in df.attrs:
+                selected_features = df.attrs['selected_features']
+        else:
+            df = res
+            selected_features = getattr(df, 'attrs', {}).get('selected_features', [])
+            
+        # Fallback: if selected_features are missing (old cache), try to infer from fs method name
+        if not selected_features:
+            fs_method = name.split('_to_')[0]
+            fs_cache_path = Path("pipeline_cache") / f"{fs_method}.pkl"
+            if fs_cache_path.exists():
+                try:
+                    with open(fs_cache_path, 'rb') as f:
+                        fs_obj = pickle.load(f)
+                        selected_features = extract_selected_features(fs_obj)
+                except:
+                    pass
+
+        # We evaluate the quality of the TRANSFORMATION
+        score = evaluate_separability(df)
+        scored_list.append({
+            'name': name, 
+            'score': score, 
+            'df': df,
+            'selected_features': selected_features
+        })
 
     scored_list.sort(key=lambda x: x['score'], reverse=True)
 
     for rank, item in enumerate(scored_list, 1):
         name, total_score, df = item['name'], item['score'], item['df']
+        used_features = item['selected_features']
         ld_cols = [c for c in df.columns if c != 'class']
         
-        fs_method = name.split('_to_')[0]
-        cache_path = Path("pipeline_cache") / f"{fs_method}.pkl"
-        
-        used_features = []
-        if cache_path.exists():
-            try:
-                with open(cache_path, 'rb') as f:
-                    fs_data = pickle.load(f)
-                    # FILTER: Keep only columns that are in original_df AND are numeric
-                    potential_feats = [c for c in fs_data.columns if c not in ['class', 'target']]
-                    # This ensures we don't try to correlate strings like 'calmodulin-compact'
-                    used_features = original_df[potential_feats].select_dtypes(include=[np.number]).columns.tolist()
-            except Exception:
-                pass
-        
+        # Verify used_features against original_df to ensure they are numeric and exist
+        used_features = [f for f in used_features if f in original_df.columns and pd.api.types.is_numeric_dtype(original_df[f])]
         print(f"{rank:<5} | {name:<25} | {total_score:<12.4f} | {len(ld_cols)}")
         print(f"      📉 Selection Stats: {len(used_features)} numeric features available for mapping.")
+        sys.stdout.flush()
 
         try:
             if used_features:
                 original_numeric = original_df[used_features] 
                 common_idx = original_numeric.index.intersection(df.index)
                 
+                if len(common_idx) < 10:
+                    print(f"      ↳ Warning: Low index overlap ({len(common_idx)} rows). Check for filter mismatch.")
+                
+                # Calculate per-component separability
+                comp_scores = evaluate_separability(df, target_col='class', return_individual=True)
+                total_comp_score = sum(comp_scores.values()) + 1e-9
+                
                 for ld in ld_cols:
-                    # Calculate correlation only for numeric slices
-                    corrs = original_numeric.loc[common_idx].corrwith(df.loc[common_idx, ld])
-                    sig_feats = corrs[corrs.abs() > corr_threshold].sort_values(ascending=False)
+                    if ld not in df.columns: continue
                     
-                    if not sig_feats.empty:
-                        feat_info = ", ".join([f"{k} ({corrs[k]:.2f})" for k in sig_feats.index])
-                        print(f"      ↳ {ld}: {feat_info}")
+                    # 1. Separability contribution %
+                    c_score = comp_scores.get(ld, 0)
+                    c_pct = (c_score / total_comp_score) * 100
+                    
+                    # 2. Top 5 features by absolute correlation
+                    corrs = original_numeric.loc[common_idx].corrwith(df.loc[common_idx, ld])
+                    top_5 = corrs.abs().sort_values(ascending=False).head(5)
+                    
+                    feat_info = ", ".join([f"{k} ({corrs[k]:.2f})" for k in top_5.index])
+                    print(f"      ↳ {ld} ({c_pct:.1f}%): {feat_info}")
+                sys.stdout.flush()
             else:
                 print("      ↳ Info: No numeric survivors found for feature mapping.")
+                sys.stdout.flush()
         except Exception as e:
             print(f"      ↳ Feature Mapping Error: {e}")
+            sys.stdout.flush()
             
         if rank <= 3:
-            if len(ld_cols) >= 3:
-                visualize_cluster_biplot_3d(original_df, df, name, survivors=used_features)
-            elif len(ld_cols) == 2:
-                visualize_cluster_biplot(original_df, df, name, survivors=used_features)
+            try:
+                if len(ld_cols) >= 3:
+                    visualize_cluster_biplot_3d(original_df, df, name, survivors=used_features)
+                elif len(ld_cols) == 2:
+                    visualize_cluster_biplot(original_df, df, name, survivors=used_features)
+                elif len(ld_cols) == 1:
+                    visualize_cluster_1d(df, name) # Add this call!
+            except Exception as viz_e:
+                print(f"      ↳ Visualization Error: {viz_e}")
+                sys.stdout.flush()
         print("-" * 100)
+        sys.stdout.flush()
 
     import gc
     gc.collect()
+
+def visualize_cluster_1d(transformed_df, pipeline_name, target_col='class'):
+    import plotly.express as px
+    ld_col = [c for c in transformed_df.columns if c != target_col][0]
+    
+    fig = px.strip(transformed_df, 
+                   x=ld_col, 
+                   y=target_col, 
+                   color=target_col,
+                   title=f"1D Distribution: {pipeline_name}",
+                   labels={ld_col: "Component 1"},
+                   template="plotly_white")
+    
+    fig.update_layout(showlegend=False)
+    fig.show()
 
 def visualize_cluster_biplot_3d(original_df, transformed_df, pipeline_name, target_col='class', stride=20, survivors=None):
     import plotly.graph_objects as go
@@ -620,14 +804,25 @@ def visualize_cluster_biplot_3d(original_df, transformed_df, pipeline_name, targ
     
     fig = go.Figure()
 
-    # 1. Plot Clusters
+    # 1. Plot Clusters with Metadata Hover
+    # Identify metadata: only include standardized metadata columns
+    meta_cols = [c for c in original_df.columns if c in METADATA_COLS]
+    
     for cls in df_plot[target_col].unique():
         cls_subset = df_plot[df_plot[target_col] == cls]
+        
+        # Pull metadata for this subset
+        common_idx = cls_subset.index.intersection(original_df.index)
+        meta_subset = original_df.loc[common_idx, meta_cols]
+        
         fig.add_trace(go.Scatter3d(
             x=cls_subset[ld_cols[0]], y=cls_subset[ld_cols[1]], z=cls_subset[ld_cols[2]],
             mode='markers', name=str(cls),
-            marker=dict(size=3, opacity=0.5),
-            hovertemplate=f"Class: {cls}<extra></extra>"
+            marker=dict(size=3, opacity=0.8),
+            customdata=meta_subset,
+            hovertemplate="<b>Class: %{name}</b><br>" + 
+                          "<br>".join([f"{c}: %{{customdata[{i}]}}" for i, c in enumerate(meta_cols)]) + 
+                          "<extra></extra>"
         ))
 
     # 2. Add Feature Arrows (Loadings) - Numeric Only!
@@ -657,6 +852,66 @@ def visualize_cluster_biplot_3d(original_df, transformed_df, pipeline_name, targ
     fig.update_layout(
         title=f"3D Biplot: {pipeline_name}",
         scene=dict(xaxis_title=ld_cols[0], yaxis_title=ld_cols[1], zaxis_title=ld_cols[2]),
+        template="plotly_white"
+    )
+    fig.show()
+
+def visualize_cluster_biplot(original_df, transformed_df, pipeline_name, target_col='class', stride=20, survivors=None):
+    import plotly.graph_objects as go
+    ld_cols = [c for c in transformed_df.columns if c != target_col]
+    centered_df = transformed_df.copy()
+    centered_df[ld_cols] = transformed_df[ld_cols] - transformed_df[ld_cols].mean()
+    df_plot = centered_df.iloc[::stride]
+    
+    fig = go.Figure()
+
+    # 1. Plot Clusters with Metadata Hover
+    meta_cols = [c for c in original_df.columns if c in METADATA_COLS]
+    
+    for cls in df_plot[target_col].unique():
+        cls_subset = df_plot[df_plot[target_col] == cls]
+        
+        # Pull metadata for this subset
+        common_idx = cls_subset.index.intersection(original_df.index)
+        meta_subset = original_df.loc[common_idx, meta_cols]
+
+        fig.add_trace(go.Scatter(
+            x=cls_subset[ld_cols[0]], y=cls_subset[ld_cols[1]],
+            mode='markers', name=str(cls),
+            marker=dict(size=8, opacity=0.6),
+            customdata=meta_subset,
+            hovertemplate="<b>Class: %{name}</b><br>" + 
+                          "<br>".join([f"{c}: %{{customdata[{i}]}}" for i, c in enumerate(meta_cols)]) + 
+                          "<extra></extra>"
+        ))
+
+    # 2. Add Feature Arrows (Loadings)
+    if survivors:
+        df_sampled = original_df.iloc[::stride]
+        original_numeric = df_sampled[survivors].select_dtypes(include=[np.number])
+        common_idx = original_numeric.index.intersection(df_plot.index)
+        
+        if not original_numeric.empty:
+            loadings = original_numeric.loc[common_idx].apply(
+                lambda x: df_plot.loc[common_idx, ld_cols[:2]].corrwith(x)
+            ).T
+            
+            scale = df_plot[ld_cols[:2]].abs().max().max() * 0.9
+            top_features = loadings.abs().sum(axis=1).sort_values(ascending=False).head(10).index
+
+            for feat in top_features:
+                vx, vy = loadings.loc[feat] * scale
+                fig.add_trace(go.Scatter(
+                    x=[0, vx], y=[0, vy],
+                    mode='lines+text', text=["", feat],
+                    textposition="top center",
+                    line=dict(color='red', width=2),
+                    legendgroup="arrows", showlegend=False
+                ))
+
+    fig.update_layout(
+        title=f"2D Biplot: {pipeline_name}",
+        xaxis_title=ld_cols[0], yaxis_title=ld_cols[1],
         template="plotly_white"
     )
     fig.show()

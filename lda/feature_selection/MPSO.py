@@ -27,9 +27,9 @@ def compute_fisher_scores(df_iterator, target_col='class', stride=1):
             chunk = chunk.iloc[::stride]
             
         if feature_cols is None:
-            # Explicitly exclude all metadata columns including 'time'
+            # Explicitly exclude metadata and target column
             feature_cols = [c for c in get_feature_cols(chunk) 
-                           if c not in METADATA_COLS and pd.api.types.is_numeric_dtype(chunk[c])]
+                           if c != target_col and c not in METADATA_COLS and pd.api.types.is_numeric_dtype(chunk[c])]
         
         y = chunk[target_col].values
         for label in np.unique(y):
@@ -63,7 +63,7 @@ def compute_fisher_scores(df_iterator, target_col='class', stride=1):
 # --- MPSO PROBLEM DEFINITION ---
 
 class MPSOProjectionProblem(Problem):
-    def __init__(self, X_train, y_train, dims, alpha=0.9, threshold=0.5, n_estimators=5, cv=3):
+    def __init__(self, X_train, y_train, dims, alpha=0.9, threshold=0.5, n_estimators=5, cv=3, redundancy_weight=0.2):
         super().__init__(dimension=X_train.shape[1] * dims, lower=0, upper=1)
         self.X_train, self.y_train = X_train, y_train
         self.dims = dims
@@ -71,6 +71,7 @@ class MPSOProjectionProblem(Problem):
         self.threshold = threshold
         self.n_estimators = n_estimators
         self.cv = cv
+        self.redundancy_weight = redundancy_weight
         self.n_feats = X_train.shape[1]
         self.eval_count = 0  # Track progress
 
@@ -78,9 +79,12 @@ class MPSOProjectionProblem(Problem):
         # Selection Matrix (Features x Dims)
         self.eval_count += 1
         
-        # Print progress every 50 evaluations
+        # Heartbeat: Visual confirmation that the code is running
         if self.eval_count % 50 == 0:
-            print(f"  > Evaluations completed: {self.eval_count}...", end='\r')
+            print(f"  > Evaluations completed: {self.eval_count}...")
+        elif self.eval_count % 5 == 0:
+            print(".", end="", flush=True)
+
         sel_matrix = (x > self.threshold).reshape((self.n_feats, self.dims))
         
         if np.any(np.sum(sel_matrix, axis=0) == 0):
@@ -93,80 +97,126 @@ class MPSOProjectionProblem(Problem):
         acc = cross_val_score(clf, projected, self.y_train, cv=self.cv).mean()
 
         sparsity = np.sum(sel_matrix) / (self.n_feats * self.dims)
-        return self.alpha * (1 - acc) + (1 - self.alpha) * sparsity
+        
+        # --- Redundancy Penalty (Correlation between dimensions) ---
+        if self.dims > 1:
+            try:
+                # Add tiny noise to avoid constant columns causing NaN correlation
+                noise = np.random.normal(0, 1e-10, projected.shape)
+                corr_matrix = np.abs(np.corrcoef(projected + noise, rowvar=False))
+                # Average of upper triangle (excluding diagonal)
+                redundancy = (np.sum(corr_matrix) - self.dims) / (self.dims * (self.dims - 1))
+            except:
+                redundancy = 1.0 # Max penalty on error
+        else:
+            redundancy = 0
+            
+        # Unified Fitness Score
+        # Trade-off between (Accuracy/Sparsity) and Independence (Redundancy)
+        base_fitness = self.alpha * (1 - acc) + (1 - self.alpha) * sparsity
+        return (1.0 - self.redundancy_weight) * base_fitness + self.redundancy_weight * redundancy
 
 # --- MAIN PIPELINE ---
-def run_mpso_pipeline(df_iterator_factory, target_col='class', dims=5, candidate_limit=250, mpso_iters=10, alpha=0.9, threshold=0.5, population_size=None, pop_scaling=0.02, min_pop=40, max_pop=100, n_estimators=5, cv=3, seed=42, stride=1):
+def run_mpso_pipeline(df_iterator_factory, target_col='class', dims=5, candidate_limit=250, max_iter=10, 
+                        alpha=0.9, threshold=0.5, redundancy_weight=0.2, population_size=None, stride=1, knee_S=2.0, **kwargs):
     """
     Integrated Pipeline: Optimizes on strided data, returns FULL projected dataset.
+    Advanced parameters (pop_scaling, min_pop, max_pop, n_estimators, cv, seed) 
+    can be passed via kwargs.
     """
+    # Internal defaults for advanced parameters
+    pop_scaling = kwargs.get('pop_scaling', 0.02)
+    min_pop = kwargs.get('min_pop', 40)
+    max_pop = kwargs.get('max_pop', 100)
+    n_estimators = kwargs.get('n_estimators', 3)
+    cv = kwargs.get('cv', 3)
+    seed = kwargs.get('seed', 42)
+    
     # 1. Pass 1: Filter (Strided)
     fisher_scores = compute_fisher_scores(df_iterator_factory(), target_col, stride=stride)
     if fisher_scores.empty:
         return pd.DataFrame()
         
-    candidates = fisher_scores.index[:candidate_limit].tolist()
+    if candidate_limit is None:
+        from kneed import KneeLocator
+        y_vals = fisher_scores.values
+        kn = KneeLocator(range(len(y_vals)), y_vals, curve='convex', direction='decreasing', S=knee_S)
+        cutoff_idx = kn.knee if kn.knee is not None else min(250, len(y_vals))
+        candidates = fisher_scores.index[:cutoff_idx+1].tolist()
+        print(f"Dynamic candidate selection: Fisher score knee at index {cutoff_idx} ({len(candidates)} features)")
+    else:
+        candidates = fisher_scores.index[:candidate_limit].tolist()
+
+    if dims is None:
+        dims = 5
+        print(f"MPSO: Output dimensions set to default (dims={dims})")
     
     # 2. Pass 2: Selective RAM Load (Strided for MPSO)
     print(f"Pass 2: Loading search data (stride={stride})...")
     search_data = []
-    # FIX: Dynamically identify all available metadata from your config
     meta_to_keep = [c for c in METADATA_COLS if c != target_col]
     
     for chunk in df_iterator_factory():
         if stride > 1:
             chunk = chunk.iloc[::stride]
-        available = [c for c in candidates + [target_col] + meta_to_keep if c in chunk.columns]
+        # Use dict.fromkeys to preserve order while removing duplicates (e.g., if target_col is in candidates or meta)
+        cols_to_extract = list(dict.fromkeys(candidates + [target_col] + meta_to_keep))
+        available = [c for c in cols_to_extract if c in chunk.columns]
         search_data.append(chunk[available])
     
-    temp_df = pd.concat(search_data, ignore_index=True)
+    temp_df = pd.concat(search_data, ignore_index=False)
     X_search = temp_df[candidates].values
     y_search = temp_df[target_col].values
     
     del search_data
     gc.collect()
 
-    # 3. Particle Swarm Optimization (Still runs on strided data for speed)
+    # 3. Particle Swarm Optimization
     if population_size is None:
         dynamic_pop = int(np.clip(len(candidates) * dims * pop_scaling, min_pop, max_pop))
     else:
         dynamic_pop = population_size
         
-    print(f"Running MPSO on {X_search.shape[0]} strided samples...")
-    problem = MPSOProjectionProblem(X_search, y_search, dims=dims, alpha=alpha, threshold=threshold, n_estimators=n_estimators, cv=cv)
-    task = Task(problem, max_iters=mpso_iters)
+    print(f"Beginning Swarm Optimization on {X_search.shape[0]} samples...")
+    problem = MPSOProjectionProblem(X_search, y_search, dims=dims, alpha=alpha, threshold=threshold, 
+                                     n_estimators=n_estimators, cv=cv, redundancy_weight=redundancy_weight)
+    task = Task(problem, max_iters=max_iter)
     algorithm = ParticleSwarmOptimization(population_size=dynamic_pop, seed=seed)
     
     best_x, _ = algorithm.run(task)
+    print(f"\n✅ Optimization complete.")
     
-    # Generate the "Recipe" matrix
-    final_sel = (best_x > threshold).reshape((len(candidates), dims))
+    # Generate the "Recipe" matrix and Column Names ONCE
+    best_x_reshaped = best_x.reshape((len(candidates), dims))
+    final_sel = (best_x_reshaped > threshold)
     projection_weights = np.sum(final_sel, axis=0) + 1e-12
 
-    # --- FIX: Pass 3 - Apply to FULL Dataset ---
-    print("Pass 3: Applying optimized projection to the FULL dataset...")
+    dim_columns = []
+    for dim_idx in range(dims):
+        selected_in_dim = np.where(final_sel[:, dim_idx])[0]
+        if len(selected_in_dim) > 0:
+            dim_scores = best_x_reshaped[selected_in_dim, dim_idx]
+            # Take up to top 2 contributing features for the name
+            top_local_idx = np.argsort(dim_scores)[-2:]
+            top_features = [candidates[selected_in_dim[i]] for i in top_local_idx]
+            dim_name = "_".join(top_features)
+        else:
+            dim_name = f"dim{dim_idx}"
+        dim_columns.append(f'MPSO_{dim_name}')
+
+    # --- PASS 3: Apply to FULL Dataset ---
+    print("Pass 3: Recovering all rows and applying projection...")
     full_results = []
     
     for chunk in df_iterator_factory():
-        # 1. Project the candidate features
+        # Ensure only available candidates are used (safeguard)
+        valid_candidates = [c for c in candidates if c in chunk.columns]
+        if len(valid_candidates) != len(candidates):
+             # This should not happen if Pass 1/2 were consistent
+             raise ValueError("Mismatch between candidate features and available columns in FULL pass.")
+             
         X_chunk = chunk[candidates].values
         projected_chunk = np.matmul(X_chunk, final_sel) / projection_weights
-        
-        # 2. Rebuild the chunk with projected dimensions
-        # Create meaningful column names based on selected features
-        selected_feature_indices = np.where(best_x > threshold)[0]
-        selected_feature_names = [candidates[i] for i in selected_feature_indices]
-        
-        # For each projected dimension, find the most contributing original features
-        dim_columns = []
-        for dim_idx in range(dims):
-            # Get weights for this dimension across all selected features
-            dim_weights = final_sel[:, dim_idx]
-            # Get top contributing features (up to 3 for naming)
-            top_features_idx = np.argsort(dim_weights)[-3:]  # Top 3 contributors
-            top_features = [candidates[i] for i in top_features_idx if i < len(candidates)]
-            dim_name = "_".join(top_features[:2])  # Use top 2 for column name
-            dim_columns.append(f'MPSO_{dim_name}')
         
         res_chunk = pd.DataFrame(
             projected_chunk, 
@@ -174,19 +224,78 @@ def run_mpso_pipeline(df_iterator_factory, target_col='class', dims=5, candidate
             index=chunk.index
         )
         
-        # 3. Carry over target and EVERY available metadata column
         res_chunk[target_col] = chunk[target_col].values
-        
-        # Only grab metadata that actually exists in this specific chunk
         current_meta = [c for c in meta_to_keep if c in chunk.columns]
         for meta in current_meta:
             res_chunk[meta] = chunk[meta].values
         
         full_results.append(res_chunk)
 
-    final_df = pd.concat(full_results, ignore_index=True)
-    
-    print(f"✅ MPSO Complete. Full dataset ({len(final_df)} rows) reduced to {dims} dimensions.")
+    final_df = pd.concat(full_results, ignore_index=False)
+    gc.collect()
+
+    # --- STANDARDIZED VISUALIZATION ---
+    visualize_mpso_diagnostics(final_df, fisher_scores, candidates, final_sel, target_col)
+
+    # Identify which original features actually contributed (safeguard)
+    contributing_mask = np.any(final_sel, axis=1)
+    final_df.attrs['selected_features'] = [candidates[i] for i, m in enumerate(contributing_mask) if m]
+
+    return final_df
+
+def visualize_mpso_diagnostics(final_df, fisher_scores, candidates, final_sel, target_col):
+    """Separate visualization function for MPSO diagnostics."""
+    print("📊 Generating MPSO diagnostic plots...")
+    try:
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+        
+        fig, axes = plt.subplots(1, 3, figsize=(21, 6))
+        sns.set_theme(style="whitegrid")
+        
+        # 1. Signal Strength (Fisher Scree Plot)
+        y_vals = fisher_scores.values
+        axes[0].plot(range(len(y_vals)), y_vals, color='grey', alpha=0.5)
+        candidate_indices = [fisher_scores.index.get_loc(c) for c in candidates if c in fisher_scores.index]
+        axes[0].scatter(candidate_indices, fisher_scores.iloc[candidate_indices], color='orange', s=20, alpha=0.6, label='Candidates')
+        
+        # Highlight top MPSO contributors
+        top_contributor_mask = np.any(final_sel, axis=1)
+        top_contributor_indices = [fisher_scores.index.get_loc(candidates[i]) for i, m in enumerate(top_contributor_mask) if m]
+        axes[0].scatter(top_contributor_indices, fisher_scores.iloc[top_contributor_indices], color='red', s=45, label='Top Contributors', zorder=5)
+        
+        axes[0].set_title("Feature Signal Strength (Fisher)", fontsize=14)
+        axes[0].set_xlabel("Feature Rank")
+        axes[0].set_ylabel("Fisher Score")
+        axes[0].legend()
+        
+        # 2. Redundancy (Correlation of Projected Dimensions)
+        proj_cols = [c for c in final_df.columns if c.startswith('MPSO_')]
+        if len(proj_cols) > 1:
+            corr = final_df[proj_cols].corr()
+            sns.heatmap(corr, cmap="coolwarm", center=0, ax=axes[1], annot=False)
+            axes[1].set_title("Projected Dimension Redundancy", fontsize=14)
+        else:
+            axes[1].text(0.5, 0.5, "Need 2+ Dims\nfor Heatmap", ha='center')
+            
+        # 3. State Space Mapping (Projected View)
+        if len(proj_cols) >= 2:
+            f1, f2 = proj_cols[0], proj_cols[1]
+            sample_df = final_df.sample(min(2000, len(final_df)))
+            sns.scatterplot(data=sample_df, x=f1, y=f2, hue=target_col, palette="deep", s=20, alpha=0.7, ax=axes[2])
+            axes[2].set_title(f"MPSO State Space\n{f1} vs {f2}", fontsize=14)
+        else:
+            axes[2].text(0.5, 0.5, "Need 2+ Dims\nfor Scatter Plot", ha='center')
+            
+        plt.tight_layout()
+        plt.show()
+    except Exception as e:
+        print(f"Visualization failed: {e}")
+
+    # Identify which original features actually contributed (safeguard)
+    contributing_mask = np.any(final_sel, axis=1)
+    final_df.attrs['selected_features'] = [candidates[i] for i, m in enumerate(contributing_mask) if m]
+
     return final_df
 
 if __name__ == "__main__":
