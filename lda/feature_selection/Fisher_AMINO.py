@@ -4,9 +4,8 @@ import numpy as np
 import pandas as pd
 import gc
 from kneed import KneeLocator
-import matplotlib.pyplot as plt
-import seaborn as sns
 from ..feature_scaling.standard import create_standard_scaled_generator
+from .visualization import visualize_amino_diagnostics
 
 # Path handling for amino
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -115,53 +114,6 @@ def extract_candidates_only(df_iterator_factory, target_col, candidates):
     full_df = pd.concat(chunk_generator(), ignore_index=False)
     gc.collect()
     return full_df
-
-def visualize_amino_diagnostics(fisher_series, candidate_df, final_features, target_col):
-    """Standardized diagnostic dashboard for Feature Selection results."""
-    print("📊 Generating AMINO diagnostic plots...")
-    try:
-        import matplotlib.pyplot as plt
-        import seaborn as sns
-        sns.set_theme(style="whitegrid")
-        fig, axes = plt.subplots(1, 3, figsize=(21, 6))
-        
-        # 1. Signal Strength (Fisher Scree Plot)
-        y_vals = fisher_series.values
-        axes[0].plot(range(len(y_vals)), y_vals, color='#333333', lw=1, alpha=0.5)
-        axes[0].fill_between(range(len(y_vals)), y_vals, color='#333333', alpha=0.1)
-        
-        # Highlight final AMINO selected features
-        if len(final_features) > 0:
-            selected_indices = [fisher_series.index.get_loc(f) for f in final_features if f in fisher_series.index]
-            axes[0].scatter(selected_indices, fisher_series.iloc[selected_indices], color='red', s=45, label='AMINO Selected', zorder=5)
-            axes[0].legend()
-            
-        axes[0].set_title("Feature Signal Strength (Fisher)", fontsize=14)
-        axes[0].set_xlabel("Feature Rank")
-        axes[0].set_ylabel("Fisher Score")
-        axes[0].set_yscale('log')
-        
-        # 2. Redundancy (Correlation Heatmap)
-        if len(final_features) > 1:
-            corr = candidate_df[final_features].corr()
-            sns.heatmap(corr, cmap="coolwarm", center=0, ax=axes[1], annot=False)
-            axes[1].set_title("Feature Redundancy (Correlation)", fontsize=14)
-        else:
-            axes[1].text(0.5, 0.5, "Need 2+ Features\nfor Heatmap", ha='center')
-
-        # 3. State Space Mapping (2D Scatter)
-        if len(final_features) >= 2:
-            f1, f2 = final_features[0], final_features[1]
-            sample_df = candidate_df.sample(min(2000, len(candidate_df)))
-            sns.scatterplot(data=sample_df, x=f1, y=f2, hue=target_col, palette="deep", s=20, alpha=0.7, ax=axes[2])
-            axes[2].set_title(f"State Space Mapping\n{f1} vs {f2}", fontsize=14)
-        else:
-            axes[2].text(0.5, 0.5, "Need 2+ Features\nfor Scatter Plot", ha='center')
-        
-        plt.tight_layout()
-        plt.show()
-    except Exception as e:
-        print(f"Visualization failed: {e}")
 
 def run_fisher_amino_pipeline(df_iterator_factory, target_col='class', max_outputs=5, knee_S=1.0):
     # Apply standard scaling to the data

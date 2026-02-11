@@ -4,9 +4,8 @@ import gc
 from kneed import KneeLocator
 import sys
 import os
-import matplotlib.pyplot as plt
-import seaborn as sns
 from ..feature_scaling.min_max import create_minmax_scaled_generator
+from .visualization import visualize_amino_diagnostics
 
 # 1. Path Setup
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -28,58 +27,6 @@ except ImportError as e:
 from data_access import create_dataframe_factory, get_feature_cols, METADATA_COLS
 
 # =============================================================================
-# UPGRADED VISUALIZATION
-# =============================================================================
-
-def visualize_amino_diagnostics(chi_scores, candidate_df, final_features, target_col):
-    """Standardized diagnostic dashboard for Feature Selection results."""
-    print("📊 Generating AMINO diagnostic plots...")
-    try:
-        import matplotlib.pyplot as plt
-        import seaborn as sns
-        sns.set_theme(style="whitegrid")
-        fig, axes = plt.subplots(1, 3, figsize=(21, 6))
-
-        # --- Panel 1: The Signal Landscape (Scree Plot) ---
-        sorted_scores = chi_scores.sort_values(ascending=False)
-        axes[0].plot(range(len(sorted_scores)), sorted_scores.values, color='#333333', lw=1, alpha=0.5)
-        axes[0].fill_between(range(len(sorted_scores)), sorted_scores.values, color='#333333', alpha=0.1)
-        
-        if len(final_features) > 0:
-            final_indices = [sorted_scores.index.get_loc(f) for f in final_features if f in sorted_scores.index]
-            axes[0].scatter(final_indices, sorted_scores.iloc[final_indices], color='red', s=45, zorder=5, label='AMINO Selected')
-            axes[0].legend()
-            
-        axes[0].set_title(f"Feature Signal Strength (Chi-Sq)", fontsize=14)
-        axes[0].set_xlabel("Feature Rank")
-        axes[0].set_ylabel("Chi-Squared Score")
-        axes[0].set_yscale('log')
-
-        # --- Panel 2: Redundancy (Correlation Heatmap) ---
-        if len(final_features) > 1:
-            corr = candidate_df[final_features].corr()
-            sns.heatmap(corr, cmap="coolwarm", center=0, ax=axes[1], annot=False)
-            axes[1].set_title("Feature Redundancy (Correlation)", fontsize=14)
-        else:
-            axes[1].text(0.5, 0.5, "Need 2+ Features\nfor Heatmap", ha='center')
-
-        # --- Panel 3: The Outcome (2D State Space) ---
-        if len(final_features) >= 2:
-            f1, f2 = final_features[0], final_features[1]
-            sample_df = candidate_df.sample(min(2000, len(candidate_df)))
-            sns.scatterplot(
-                data=sample_df, x=f1, y=f2, hue=target_col, 
-                palette="deep", s=20, alpha=0.7, ax=axes[2]
-            )
-            axes[2].set_title(f"State Space Mapping\n{f1} vs {f2}", fontsize=14)
-        else:
-            axes[2].text(0.5, 0.5, "Need 2+ Features\nfor Scatter Plot", ha='center')
-
-        plt.tight_layout()
-        plt.show()
-    except Exception as e:
-        print(f"Visualization failed: {e}")
-
 # =============================================================================
 # CORE PROCESSING
 # =============================================================================

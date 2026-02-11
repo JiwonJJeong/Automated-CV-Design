@@ -9,6 +9,7 @@ from niapy.problems import Problem
 from niapy.task import Task
 from niapy.algorithms.basic import ParticleSwarmOptimization
 from ..feature_scaling.standard import create_standard_scaled_generator
+from .visualization import visualize_mpso_diagnostics
 
 # Standardized helpers
 from data_access import get_feature_cols, METADATA_COLS
@@ -242,61 +243,6 @@ def run_mpso_pipeline(df_iterator_factory, target_col='class', dims=5, candidate
 
     # --- STANDARDIZED VISUALIZATION ---
     visualize_mpso_diagnostics(final_df, fisher_scores, candidates, final_sel, target_col)
-
-    # Identify which original features actually contributed (safeguard)
-    contributing_mask = np.any(final_sel, axis=1)
-    final_df.attrs['selected_features'] = [candidates[i] for i, m in enumerate(contributing_mask) if m]
-
-    return final_df
-
-def visualize_mpso_diagnostics(final_df, fisher_scores, candidates, final_sel, target_col):
-    """Separate visualization function for MPSO diagnostics."""
-    print("📊 Generating MPSO diagnostic plots...")
-    try:
-        import matplotlib.pyplot as plt
-        import seaborn as sns
-        
-        fig, axes = plt.subplots(1, 3, figsize=(21, 6))
-        sns.set_theme(style="whitegrid")
-        
-        # 1. Signal Strength (Fisher Scree Plot)
-        y_vals = fisher_scores.values
-        axes[0].plot(range(len(y_vals)), y_vals, color='grey', alpha=0.5)
-        candidate_indices = [fisher_scores.index.get_loc(c) for c in candidates if c in fisher_scores.index]
-        axes[0].scatter(candidate_indices, fisher_scores.iloc[candidate_indices], color='orange', s=20, alpha=0.6, label='Candidates')
-        
-        # Highlight top MPSO contributors
-        top_contributor_mask = np.any(final_sel, axis=1)
-        top_contributor_indices = [fisher_scores.index.get_loc(candidates[i]) for i, m in enumerate(top_contributor_mask) if m]
-        axes[0].scatter(top_contributor_indices, fisher_scores.iloc[top_contributor_indices], color='red', s=45, label='Top Contributors', zorder=5)
-        
-        axes[0].set_title("Feature Signal Strength (Fisher)", fontsize=14)
-        axes[0].set_xlabel("Feature Rank")
-        axes[0].set_ylabel("Fisher Score")
-        axes[0].legend()
-        
-        # 2. Redundancy (Correlation of Projected Dimensions)
-        proj_cols = [c for c in final_df.columns if c.startswith('MPSO_')]
-        if len(proj_cols) > 1:
-            corr = final_df[proj_cols].corr()
-            sns.heatmap(corr, cmap="coolwarm", center=0, ax=axes[1], annot=False)
-            axes[1].set_title("Projected Dimension Redundancy", fontsize=14)
-        else:
-            axes[1].text(0.5, 0.5, "Need 2+ Dims\nfor Heatmap", ha='center')
-            
-        # 3. State Space Mapping (Projected View)
-        if len(proj_cols) >= 2:
-            f1, f2 = proj_cols[0], proj_cols[1]
-            sample_df = final_df.sample(min(2000, len(final_df)))
-            sns.scatterplot(data=sample_df, x=f1, y=f2, hue=target_col, palette="deep", s=20, alpha=0.7, ax=axes[2])
-            axes[2].set_title(f"MPSO State Space\n{f1} vs {f2}", fontsize=14)
-        else:
-            axes[2].text(0.5, 0.5, "Need 2+ Dims\nfor Scatter Plot", ha='center')
-            
-        plt.tight_layout()
-        plt.show()
-    except Exception as e:
-        print(f"Visualization failed: {e}")
 
     # Identify which original features actually contributed (safeguard)
     contributing_mask = np.any(final_sel, axis=1)

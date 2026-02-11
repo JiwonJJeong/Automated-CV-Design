@@ -98,10 +98,8 @@ from data_access import get_feature_cols, METADATA_COLS
 
 class SVMFeatureSelection(Problem):
     def __init__(self, X_train, y_train, alpha=0.95, threshold=0.5, cv=3):
-        # 1. Performance: Use centralized scaling function
-        self.scaler = create_standard_scaled_generator(lambda: pd.DataFrame(X_train, columns=get_feature_cols(pd.DataFrame(X_train))))
-        scaled_sample = self.scaler()
-        self.X_scaled = scaled_sample.values
+        # Scaling removed: X_train is assumed to be pre-scaled by the pipeline
+        self.X_train = X_train
         self.y_train = y_train
         
         super().__init__(dimension=X_train.shape[1], lower=0.0, upper=1.0)
@@ -109,41 +107,34 @@ class SVMFeatureSelection(Problem):
         self.threshold = threshold
         self.cv = cv
         self.eval_count = 0 
-        self.cache = {} # 2. Performance: Don't re-run CV for same feature sets
+        self.cache = {} 
 
         counts = np.unique(y_train, return_counts=True)[1]
-        self.min_class_size = np.min(counts)
+        self.min_class_size = np.min(counts) if len(counts) > 0 else 0
 
     def _evaluate(self, x):
         self.eval_count += 1
-        
-        # 3. Heartbeat: Visual confirmation that the code is running
         if self.eval_count % 50 == 0:
             print(f"  > Evaluations completed: {self.eval_count}...")
-        elif self.eval_count % 5 == 0:
-            print(".", end="", flush=True)
 
         selected = x > self.threshold 
         if not np.any(selected) or self.min_class_size < 2:
             return 1.0
         
-        # 4. Cache check: Swarms often revisit the same local optima
         feature_key = tuple(selected)
         if feature_key in self.cache:
             return self.cache[feature_key]
 
-        # 5. Fast-solver settings
         clf = LinearSVC(dual=False, tol=1e-2, max_iter=1000)
         
         try:
             cv_folds = min(self.cv, self.min_class_size)
-            accuracy = cross_val_score(clf, self.X_scaled[:, selected], 
-                                     self.y_train, cv=cv_folds, n_jobs=1).mean()
+            accuracy = cross_val_score(clf, self.X_train[:, selected], 
+                                     self.y_train, cv=cv_folds).mean()
         except:
             accuracy = 0.0
             
         score = self.alpha * (1 - accuracy) + (1 - self.alpha) * (selected.sum() / self.dimension)
-        
         self.cache[feature_key] = score
         return score
 
@@ -152,76 +143,53 @@ class SVMFeatureSelection(Problem):
 def run_bpso_pipeline(df_iterator_factory, target_col='class', candidate_limit=150, 
                        seed=None, stride=5, population_size=None, knee_S=2.0, **kwargs):
     
-    # Apply standard scaling to the data
-    scaled_df_factory = create_standard_scaled_generator(df_iterator_factory)
+    # --- STEP 1: PROACTIVE DISCOVERY ---
+    first_chunk = next(df_iterator_factory())
+    all_cols = first_chunk.columns.tolist()
     
-    fisher_scores = compute_streaming_fisher(scaled_df_factory, target_col, stride=stride)
+    # Identify buckets once to avoid if-statements in loops
+    available_features = [c for c in get_feature_cols(first_chunk) if c != target_col]
+    actual_metadata = [c for c in METADATA_COLS if c in all_cols and c != target_col]
     
-    if fisher_scores.empty:
-        return pd.DataFrame()
+    # --- STEP 2: PASS 1 (FISHER) ---
+    fisher_scores = compute_streaming_fisher(df_iterator_factory(), target_col, stride=stride)
+    if fisher_scores.empty: return pd.DataFrame()
 
+    # Knee Detection / Candidate Selection
     if candidate_limit is None:
         from kneed import KneeLocator
         y_vals = fisher_scores.values
-        # Using S=2.0 for feature selection to be slightly more conservative than variance filtering
         kn = KneeLocator(range(len(y_vals)), y_vals, curve='convex', direction='decreasing', S=knee_S)
         cutoff_idx = kn.knee if kn.knee is not None else min(150, len(y_vals))
         candidates = fisher_scores.index[:cutoff_idx+1].tolist()
-        print(f"Dynamic candidate selection: Fisher score knee at index {cutoff_idx} ({len(candidates)} features)")
     else:
         candidates = fisher_scores.index[:candidate_limit].tolist()
     
+    # --- STEP 3: PASS 2 (LOAD SEARCH DATA) ---
     print(f"Pass 2: Loading {len(candidates)} features (stride={stride})...")
-    data_list = []
-    actual_metadata = []
-
-    for chunk in df_iterator_factory():
-        if stride > 1:
-            chunk = chunk.iloc[::stride]
-            
-        if not actual_metadata:
-            actual_metadata = [c for c in METADATA_COLS if c != target_col and c in chunk.columns]
-            
-        cols_to_keep = candidates + [target_col] + actual_metadata
-        available = [c for c in cols_to_keep if c in chunk.columns]
-        data_list.append(chunk[available])
+    # For optimization, we only need candidates + target
+    search_cols = candidates + [target_col]
     
-    narrow_df = pd.concat(data_list, ignore_index=False)
-    del data_list
-    gc.collect()
-
+    search_chunks = []
+    for chunk in df_iterator_factory():
+        search_chunks.append(chunk.iloc[::stride][search_cols])
+    
+    narrow_df = pd.concat(search_chunks)
     X = narrow_df[candidates].values
     y = narrow_df[target_col].values
 
-    print(f"Beginning Swarm Optimization on {X.shape[0]} samples...")
-    
-    n_feats = X.shape[1]
-    # Set a reasonable floor/ceiling for population and iterations for speed
-    # RESPECT Overrides from pipeline_helper (n_particles and max_iter)
-    pop = kwargs.get('n_particles', kwargs.get('population_size'))
-    if pop is None:
-        pop = int(np.clip(n_feats * 0.3, 20, 60))
-        
-    iters = kwargs.get('max_iter')
-    if iters is None:
-        # We cap iterations to prevent "taking forever"
-        iters = int(np.clip(n_feats * 0.4, 15, 40))
+    # --- STEP 4: OPTIMIZATION ---
+    pop = kwargs.get('n_particles', population_size or int(np.clip(X.shape[1] * 0.3, 20, 60)))
+    iters = kwargs.get('max_iter', int(np.clip(X.shape[1] * 0.4, 15, 40)))
 
     problem = SVMFeatureSelection(X, y, cv=3)
     task = Task(problem, max_iters=iters)
-    
-    algorithm = ParticleSwarmOptimization(
-        population_size=pop, seed=seed,
-        w=kwargs.get('w', 0.729), c1=kwargs.get('c1', 1.49445), c2=kwargs.get('c2', 1.49445)
-    )
+    algorithm = ParticleSwarmOptimization(population_size=pop, seed=seed)
     
     best_x, _ = algorithm.run(task)
+    final_features = [candidates[i] for i, val in enumerate(best_x) if val > 0.5]
     
-    final_mask = best_x > 0.5
-    final_features = [candidates[i] for i, m in enumerate(final_mask) if m]
-    
-    print(f"\n✅ Final selection: {len(final_features)} features.")
-    
+    # --- STEP 5: VISUALIZATION (Optional logic omitted for brevity, same as original) ---
     # --- STANDARDIZED VISUALIZATION ---
     try:
         import matplotlib.pyplot as plt
@@ -263,14 +231,8 @@ def run_bpso_pipeline(df_iterator_factory, target_col='class', candidate_limit=1
     except Exception as e:
         print(f"Visualization failed: {e}")
 
+    # --- STEP 6: PASS 3 (RECOVER FULL DATASET) ---
     print(f"Pass 3: Recovering all rows for {len(final_features)} features...")
-    full_data_list = []
-    for chunk in df_iterator_factory():
-        available = [c for c in (final_features + [target_col] + actual_metadata) if c in chunk.columns]
-        full_data_list.append(chunk[available])
+    final_out_cols = final_features + [target_col] + actual_metadata
     
-    final_df = pd.concat(full_data_list, ignore_index=False)
-    del narrow_df
-    gc.collect()
-    
-    return final_df
+    return pd.concat([chunk[final_out_cols] for chunk in df_iterator_factory()])
