@@ -108,13 +108,13 @@ def extract_candidates_only(df_iterator_factory, target_col, candidates):
     gc.collect()
     return full_df
 
-def run_fisher_amino_pipeline(df_iterator_factory, target_col='class', max_outputs=5, knee_S=1.0):
+def run_fisher_amino_pipeline(df_iterator_factory, target_col='class', n_amino_outputs=None, knee_sensitivity=1.0):
     # Pass 1: Fisher Scores (Using input factory directly)
     fisher_s = compute_sequential_fisher(df_iterator_factory, target_col)
     
     # Knee Detection
     y_vals = fisher_s.values
-    kn = KneeLocator(range(1, len(y_vals) + 1), y_vals, curve='convex', direction='decreasing', S=knee_S)
+    kn = KneeLocator(range(1, len(y_vals) + 1), y_vals, curve='convex', direction='decreasing', S=knee_sensitivity)
     threshold = kn.knee_y if kn.knee_y else np.percentile(y_vals, 90)
     candidate_features = fisher_s[fisher_s >= threshold].index.tolist()
 
@@ -134,12 +134,12 @@ def run_fisher_amino_pipeline(df_iterator_factory, target_col='class', max_outpu
         df_shifted = (df_shifted - d_min) / (d_max - d_min + 1e-12)
 
         ops = [amino.OrderParameter(name, df_shifted[name].values) for name in candidate_features]
-        final_ops = amino.find_ops(ops, max_outputs=max_outputs)
+        final_ops = amino.find_ops(ops, max_outputs=n_amino_outputs)
         final_names = [getattr(op, 'name', str(op)) for op in final_ops]
         del df_shifted
     else:
         print("AMINO skipped. Keeping top candidates.")
-        limit = max_outputs if max_outputs is not None else 5
+        limit = n_amino_outputs if n_amino_outputs is not None else 5
         final_names = candidate_features[:limit]
 
     visualize_amino_diagnostics(fisher_s, df_amino_input, final_names, target_col)

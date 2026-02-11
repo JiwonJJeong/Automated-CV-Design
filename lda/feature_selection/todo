@@ -1,0 +1,2 @@
+Make the None for output dims actually make sense
+(BPSO has no output dim?)

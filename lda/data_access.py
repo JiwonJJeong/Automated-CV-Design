@@ -95,8 +95,8 @@ def get_residue_feature_names(residue_list: Optional[List[int]] = None,
     # The condensed upper triangle order in row-major corresponds to squareform
     for i in range(n_res):
         for j in range(i + 1, n_res):
-            # Use 1-based indexing to match PDB residue numbering
-            names.append(f"RES{residue_list[i] + 1}_{residue_list[j] + 1}")
+            # Use actual canonical residue IDs from loaded data, not assumed +1 indexing
+            names.append(f"RES{residue_list[i]}_{residue_list[j]}")
     return names
 
 # =============================================================================
@@ -173,6 +173,125 @@ def get_data_files(base_dir: str = BASE_DIR) -> List[Dict[str, str]]:
     # Sort files by (construct, subconstruct, replica_str, start_frame)
     data_files.sort(key=lambda x: (x["construct"], x["subconstruct"], x["replica"], x["start_frame"]))
     return data_files
+
+def filter_non_bp2_distances(distance_matrix: np.ndarray, canonical_residues: np.ndarray) -> np.ndarray:
+    """
+    Filter flattened distance matrix to exclude BP2 peptide distances (residues 146+).
+    
+    For zebrafish systems, BP2 peptide residues (146+) should be excluded from 
+    pairwise distance calculations as they represent a different domain/peptide.
+    
+    Args:
+        distance_matrix (np.ndarray): Flattened upper triangle distance matrix.
+        canonical_residues (np.ndarray): Array of canonical residue IDs.
+        
+    Returns:
+        np.ndarray: Filtered distance matrix with BP2 distances set to NaN.
+    """
+    # Create mask for BP2 residues (146+)
+    bp2_mask = canonical_residues >= 146
+    
+    # Initialize filtered matrix
+    filtered_matrix = distance_matrix.copy()
+    
+    # The flattened matrix contains upper triangle elements in row-major order
+    # We need to map each element back to its (i,j) pair
+    n_residues = len(canonical_residues)
+    idx = 0
+    
+    for i in range(n_residues):
+        for j in range(i + 1, n_residues):
+            # If either residue is BP2, set distance to NaN
+            if bp2_mask[i] or bp2_mask[j]:
+                filtered_matrix[idx] = np.nan
+            idx += 1
+    
+    print(f"🛡️ Filtered {np.sum(bp2_mask)} BP2 residues (>=146) from distance matrix")
+    print(f"   📊 Original matrix shape: {distance_matrix.shape}")
+    print(f"   📊 Filtered matrix shape: {filtered_matrix.shape}")
+    print(f"   📊 BP2 residues: {canonical_residues[bp2_mask].tolist()}")
+    print(f"   📝 Note: Flattened upper triangle with interspersed BP2 distances")
+    
+    return filtered_matrix
+
+def load_canonical_resid(base_dir: str, construct: str = None, subconstruct: str = None, replica: str = None):
+    """
+    Load canonical_resid.npy file from the data directory structure.
+    
+    Args:
+        base_dir (str): Base directory containing data files.
+        construct (str, optional): Filter by specific construct.
+        subconstruct (str, optional): Filter by specific subconstruct.  
+        replica (str, optional): Filter by specific replica.
+        
+    Returns:
+        np.ndarray: Canonical residue data or None if not found.
+    """
+    import numpy as np
+    
+    base_path = Path(base_dir)
+    
+    # Look for canonical_resid.npy files
+    resid_files = list(base_path.glob("**/canonical_resid.npy"))
+    
+    if not resid_files:
+        print(f"❌ canonical_resid.npy not found in {base_dir}")
+        return None
+    
+    # Apply filters if specified
+    if construct or subconstruct or replica:
+        filtered_files = []
+        for file_path in resid_files:
+            rel_path = file_path.relative_to(base_path)
+            parts = rel_path.parts
+            
+            # Check if file matches filters
+            match = True
+            if construct and construct not in parts:
+                match = False
+            if subconstruct and subconstruct not in parts:
+                match = False
+            if replica and replica not in parts:
+                match = False
+                
+            if match:
+                filtered_files.append(file_path)
+        
+        if not filtered_files:
+            print(f"❌ No canonical_resid.npy found matching filters:")
+            if construct:
+                print(f"   🏗️  Construct: {construct}")
+            if subconstruct:
+                print(f"   🏢  Subconstruct: {subconstruct}")
+            if replica:
+                print(f"   🔢  Replica: {replica}")
+            return None
+        
+        # Use first matching file
+        resid_file = filtered_files[0]
+        print(f"📄 Loading canonical_resid.npy with filters:")
+        if construct:
+            print(f"   🏗️  Construct: {construct}")
+        if subconstruct:
+            print(f"   🏢  Subconstruct: {subconstruct}")
+        if replica:
+            print(f"   🔢  Replica: {replica}")
+    else:
+        # Use first file found
+        resid_file = resid_files[0]
+        print(f"📄 Loading canonical_resid.npy:")
+    
+    print(f"   📁 Path: {resid_file}")
+    
+    try:
+        resid_data = np.load(resid_file)
+        print(f"   📊 Shape: {resid_data.shape}")
+        print(f"   📈 Data type: {resid_data.dtype}")
+        return resid_data
+        
+    except Exception as e:
+        print(f"❌ Error loading canonical_resid.npy: {e}")
+        return None
 
 def get_h5_info(h5_path: str) -> Dict[str, Dict[str, Union[Tuple, str, float]]]:
     """
@@ -402,7 +521,8 @@ def data_iterator(base_dir: str = BASE_DIR, chunk_size: int = 10000,
                  dataset_name: str = 'distances', 
                  constructs: Optional[List[str]] = None,
                  subconstructs: Optional[List[str]] = None,
-                 min_frame: int = 0) -> Iterator[pd.DataFrame]:
+                 min_frame: int = 0,
+                 filter_bp2: bool = False) -> Iterator[pd.DataFrame]:
     """
     Unified data iterator that yields DataFrames from both H5 and NPY files.
     Automatically handles the mixed file structure and provides consistent output format.
@@ -439,9 +559,9 @@ def data_iterator(base_dir: str = BASE_DIR, chunk_size: int = 10000,
     for file_info in data_files:
         try:
             if file_info["type"] == "h5":
-                yield from _iterate_h5_file(file_info, chunk_size, dataset_name, min_frame)
+                yield from _iterate_h5_file(file_info, chunk_size, dataset_name, min_frame, filter_bp2)
             elif file_info["type"] == "npy":
-                yield from _iterate_npy_file(file_info, chunk_size, min_frame)
+                yield from _iterate_npy_file(file_info, chunk_size, min_frame, filter_bp2)
                     
         except Exception as e:
             data_iterator._error_count += 1
@@ -452,7 +572,7 @@ def data_iterator(base_dir: str = BASE_DIR, chunk_size: int = 10000,
                 print("... (suppressing further error messages)")
             continue
 
-def _iterate_h5_file(file_info: Dict[str, str], chunk_size: int, dataset_name: str, min_frame: int = 0) -> Iterator[pd.DataFrame]:
+def _iterate_h5_file(file_info: Dict[str, str], chunk_size: int, dataset_name: str, min_frame: int = 0, filter_bp2: bool = False):
     """Helper function to iterate over H5 files."""
     with h5py.File(file_info["path"], 'r') as f:
         # Determine the actual dataset name
@@ -491,11 +611,28 @@ def _iterate_h5_file(file_info: Dict[str, str], chunk_size: int, dataset_name: s
             if min_frame > 0:
                 df = df[df['frame_number'] >= min_frame].copy()
             
+            # Apply BP2 filtering if requested
+            if filter_bp2:
+                # Get canonical residues for filtering
+                try:
+                    canonical_resids = load_canonical_residues(os.path.dirname(file_info["path"]))
+                    # Filter distance data to exclude BP2 residues
+                    distance_cols = [col for col in df.columns if col.startswith('feature_')]
+                    for col in distance_cols:
+                        distance_data = df[col].values
+                        filtered_distances = filter_non_bp2_distances(distance_data, canonical_resids, filter_bp2=True)
+                        df[col] = filtered_distances
+                        
+                    if filter_bp2:
+                        print(f"🛡️ Applied BP2 filtering to {file_info['path']}")
+                except FileNotFoundError:
+                    print(f"⚠️ Could not load canonical residues for BP2 filtering: {file_info['path']}")
+            
             # Only yield if we have data after filtering
             if len(df) > 0:
                 yield df
 
-def _iterate_npy_file(file_info: Dict[str, str], chunk_size: int, min_frame: int = 0) -> Iterator[pd.DataFrame]:
+def _iterate_npy_file(file_info: Dict[str, str], chunk_size: int, min_frame: int = 0, filter_bp2: bool = False) -> Iterator[pd.DataFrame]:
     """Helper function to iterate over NPY files."""
     # Map-read the npy for memory efficiency
     data = np.load(file_info["path"], mmap_mode='r')
@@ -649,16 +786,31 @@ def list_available_constructs_subconstructs(base_dir: str = BASE_DIR) -> Tuple[D
 def create_dataframe_factory(base_dir: str = BASE_DIR, 
                              constructs: Optional[List[str]] = None,
                              subconstructs: Optional[List[str]] = None,
-                             apply_boundary_filter: bool = True, # Added Toggle
+                             apply_boundary_filter: bool = True,
+                             filter_bp2: bool = False,
                              n_edge: int = 3,
                              min_frame: int = 0,
                              **kwargs):
+    """
+    Creates a memory-efficient DataFrame factory for distance matrix data.
     
+    Args:
+        base_dir (str): Base directory containing data files.
+        constructs (List[str], optional): Filter by specific constructs only.
+        subconstructs (List[str], optional): Filter by specific subconstructs only.
+        apply_boundary_filter (bool): Apply residue boundary filtering. Default: True.
+        filter_bp2 (bool): Filter out BP2 peptide distances (residues >= 146). Default: False.
+        n_edge (int): Number of edge residues to keep. Default: 3.
+        min_frame (int): Only include frames with frame_number >= min_frame. Default: 0.
+        **kwargs: Additional keyword arguments passed to data_iterator.
+        
+    """
     def factory():
         iterator = data_iterator(base_dir=base_dir, 
                                  constructs=constructs, 
                                  subconstructs=subconstructs, 
                                  min_frame=min_frame,
+                                 filter_bp2=filter_bp2,
                                  **kwargs)
         
         for chunk in iterator:
@@ -732,35 +884,72 @@ if __name__ == "__main__":
 
 import re
 
+import re
+import pandas as pd
+
+import re
+import pandas as pd
+
 def filter_residue_boundaries(df, n_edge=3):
-    # Updated regex to match 'RES1_2' format from your get_residue_feature_names()
+    """
+    Clips terminal residues from the global ends AND any significant
+    internal sequence gaps.
+    """
     res_pattern = re.compile(r'RES(\d+)_(\d+)', re.IGNORECASE)
     res_cols = [col for col in df.columns if res_pattern.match(col)]
     
     if not res_cols:
         return df
 
-    # Extract indices
-    all_indices = []
+    # 1. Identify all unique residue indices
+    all_indices = set()
     for col in res_cols:
-        nums = res_pattern.match(col).groups()
-        all_indices.extend([int(nums[0]), int(nums[1])])
+        idx1, idx2 = map(int, res_pattern.match(col).groups())
+        all_indices.update([idx1, idx2])
     
-    unique_indices = sorted(list(set(all_indices)))
-    
-    # Define forbidden boundary numbers
-    low_bounds = set(unique_indices[:n_edge])
-    high_bounds = set(unique_indices[-n_edge:])
-    forbidden = low_bounds.union(high_bounds)
-    
+    unique_indices = sorted(list(all_indices))
+    if not unique_indices:
+        return df
+
+    to_remove = set()
+
+    # 2. Rule: Always clip Global Start and Global End
+    min_res, max_res = unique_indices[0], unique_indices[-1]
+    # Handle global start (e.g., 2, 3, 4)
+    to_remove.update(unique_indices[:n_edge])
+    # Handle global end (e.g., 300, 299, 298)
+    to_remove.update(unique_indices[-n_edge:])
+
+    # 3. Rule: Find internal gaps and clip their boundaries
+    # A gap is defined as a jump in index > 1 (e.g., jumping from 100 to 200)
+    for i in range(len(unique_indices) - 1):
+        curr_res = unique_indices[i]
+        next_res = unique_indices[i+1]
+        
+        if next_res - curr_res > 1:
+            print(f"🌉 Detected sequence gap between {curr_res} and {next_res}")
+            
+            # Clip residues leading into the gap (e.g., 100, 99, 98)
+            # We use slicing to ensure we don't grab more than what's available
+            to_remove.update(unique_indices[max(0, i-n_edge+1) : i+1])
+            
+            # Clip residues coming out of the gap (e.g., 200, 201, 202)
+            to_remove.update(unique_indices[i+1 : i+1+n_edge])
+
+    # 4. Filter columns
     cols_to_keep = []
     for col in df.columns:
         match = res_pattern.match(col)
         if match:
             idx1, idx2 = map(int, match.groups())
-            if idx1 not in forbidden and idx2 not in forbidden:
+            if idx1 not in to_remove and idx2 not in to_remove:
                 cols_to_keep.append(col)
         else:
-            cols_to_keep.append(col) # Keep 'class', 'construct', etc.
-            
+            cols_to_keep.append(col)
+
+    # Only print once using a flag
+    if not hasattr(filter_residue_boundaries, '_print_shown'):
+        print(f"🗑️ Removing {len(to_remove)} specific residues: {sorted(list(to_remove))}")
+        filter_residue_boundaries._print_shown = True
+    
     return df[cols_to_keep]

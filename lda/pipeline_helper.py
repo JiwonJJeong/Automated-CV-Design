@@ -27,8 +27,9 @@ DEFAULT_PARAMETERS = {
     'feature_selection': {
         'bpso': {
             'candidate_limit': {'value': None, 'help': "Max features for optimization (None = Dynamic selection via Fisher Score Knee)"},
-            'knee_S': {'value': 2.0, 'help': "Sensitivity for the candidate filtering knee - higher = more features"},
+            'knee_sensitivity': {'value': 2.0, 'help': "Sensitivity for candidate filtering knee - higher = more features"},
             'population_size': {'value': 20, 'help': "Swarm size - more particles = better exploration"},
+            'n_particles': {'value': None, 'help': "Override population size for PSO algorithm (None = use population_size)"},
             'max_iter': {'value': 30, 'help': "Max iterations - higher = more optimization"},
             'w': {'value': 0.729, 'help': "Inertia weight - controls exploration vs exploitation"},
             'c1': {'value': 1.49445, 'help': "Cognitive parameter - individual learning influence"},
@@ -36,26 +37,26 @@ DEFAULT_PARAMETERS = {
             'stride': {'value': 10, 'help': "Data sampling stride - higher = less data"}
         },
         'mpso': {
-            'dims': {'value': None, 'help': "Output dimensions (None = default 5)"},
+            'n_dimensions': {'value': None, 'help': "Output dimensions (None = default 5)"},
             'candidate_limit': {'value': None, 'help': "Max features for optimization (None = Dynamic selection via Fisher Score Knee)"},
-            'knee_S': {'value': 2.0, 'help': "Sensitivity for the candidate filtering knee - higher = more features"},
-            'max_iter': {'value': 10, 'help': "PSO iterations - higher = better optimization"},
-            'population_size': {'value': 40, 'help': "Swarm population size - larger = better search"},
-            'alpha': {'value': 0.9, 'help': "Accuracy-sparsity tradeoff - 0.0=accuracy, 1.0=sparsity"},
-            'threshold': {'value': 0.5, 'help': "Feature selection threshold - higher = fewer features"},
-            'redundancy_weight': {'value': 0.2, 'help': "Dimension independence penalty (0.0=none, 1.0=max redundancy reduction)"},
-            'stride': {'value': 15, 'help': "Data sampling stride - higher = less data"}
+            'knee_sensitivity': {'value': 2.0, 'help': "Sensitivity for the candidate filtering knee - higher = more features"},
+            'optimization_iterations': {'value': 10, 'help': "PSO iterations - higher = better optimization"},
+            'max_candidates': {'value': 40, 'help': "Swarm population size - larger = better search"},
+            'accuracy_sparsity_weight': {'value': 0.9, 'help': "Accuracy-sparsity tradeoff - 0.0=accuracy, 1.0=sparsity"},
+            'feature_threshold': {'value': 0.5, 'help': "Feature selection threshold - higher = fewer features"},
+            'dimension_independence_penalty': {'value': 0.2, 'help': "Dimension independence penalty (0.0=none, 1.0=max redundancy reduction)"},
+            'sampling_stride': {'value': 15, 'help': "Data sampling stride - higher = less data"}
         },
         'fisher_amino': {
-            'max_outputs': {'value': None, 'help': "Target features (None = Dynamic selection via AMINO Distortion Jump method)"},
-            'knee_S': {'value': 2.0, 'help': "Sensitivity for the initial Fisher candidate knee - higher = more features"}
+            'n_amino_outputs': {'value': None, 'help': "Target features (None = Dynamic selection via AMINO Distortion Jump method)"},
+            'knee_sensitivity': {'value': 2.0, 'help': "Sensitivity for the initial Fisher candidate knee - higher = more features"}
         },
         'chi_sq_amino': {
             'stride': {'value': 25, 'help': "Data sampling stride - higher = less memory usage"},
             'max_amino': {'value': None, 'help': "Target features (None = Dynamic selection via AMINO Distortion Jump method)"},
             'q_bins': {'value': 5, 'help': "Quantile bins for chi-square - higher = more resolution"},
             'sample_rows': {'value': 20000, 'help': "Sample size for binning - higher = more accurate bins"},
-            'knee_S': {'value': 5.0, 'help': "Sensitivity for the initial Chi-Square candidate knee - higher = more features"}
+            'knee_sensitivity': {'value': 5.0, 'help': "Sensitivity for the initial Chi-Square candidate knee - higher = more features"}
         }
     },
     'dimensionality_reduction': {
@@ -208,6 +209,11 @@ def run_interactive_pipeline(data_factory, pipeline_configs, class_assignment_fu
         return pd.concat(list(variance_result_gen), ignore_index=False)
     
     variance_df = run_interactive_step_generic("VARIANCE", variance_cache_path, 'variance', None, variance_exec)
+    
+    # Extract DataFrame from cached result if it's a dictionary
+    if isinstance(variance_df, dict) and 'data' in variance_df:
+        variance_df = variance_df['data']
+    
     print(f"Variance Output: {variance_df.shape}")
     
     # --- AUTOMATIC STANDARD SCALING ---
@@ -215,10 +221,10 @@ def run_interactive_pipeline(data_factory, pipeline_configs, class_assignment_fu
     
     # Create scaled data directly, no need to keep variance_df
     def variance_factory():
-        yield variance_df
+        return variance_df
     
     scaled_factory = create_standard_scaled_generator(variance_factory)
-    scaled_df = pd.concat(list(scaled_factory()), ignore_index=False)
+    scaled_df = scaled_factory()
     print(f"✅ Applied standard scaling: {scaled_df.shape}")
     
     # Clean up variance_df to save memory
@@ -473,7 +479,7 @@ def run_interactive_step_generic(name, cache_path, param_category, param_subcate
     # Check cache
     if cache_path.exists():
         load_cache = input(f"Found cached result for {name} ({cache_path}). Load? (Y/n): ").strip().lower()
-        if load_cache != 'n':
+        if load_cache == 'y':
             try:
                 with open(cache_path, 'rb') as f:
                     result = pickle.load(f)
@@ -518,6 +524,8 @@ def run_interactive_step_generic(name, cache_path, param_category, param_subcate
             if retry == 'n':
                 print(f"Skipping {name}.")
                 break
+
+    return result
 
 # =============================================================================
 # EXECUTION DISPATCHERS

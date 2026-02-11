@@ -190,8 +190,8 @@ def extract_candidates_only(df_iterator, target_col, candidates, stride=1):
 # =============================================================================
 
 def run_feature_selection_pipeline(df_iterator_factory, target_col='class', stride=5, max_amino=10, 
-                                   q_bins=5, sample_rows=20000, knee_S=5.0, 
-                                   bins=None, distortion_filename=None, **kwargs):
+                                   q_bins=5, sample_rows=20000, knee_sensitivity=5.0, 
+                                   bins=None, distortion_filename=None):
     
     # 1. SETUP: Create the Local Min-Max Wrapper
     # This ensures Chi-Square/AMINO see 0-1 data, but we don't change the original factory
@@ -211,7 +211,7 @@ def run_feature_selection_pipeline(df_iterator_factory, target_col='class', stri
     y_vals = sorted(chi_s.values, reverse=True)
     # Protection against tiny datasets
     if len(y_vals) > 0:
-        kn = KneeLocator(range(1, len(y_vals) + 1), y_vals, curve='convex', direction='decreasing', S=knee_S)
+        kn = KneeLocator(range(1, len(y_vals) + 1), y_vals, curve='convex', direction='decreasing', S=knee_sensitivity)
         threshold = kn.knee_y if kn.knee_y is not None else 0.0
     else:
         threshold = 0.0

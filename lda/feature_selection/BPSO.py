@@ -143,7 +143,8 @@ class SVMFeatureSelection(Problem):
 # --- MAIN PIPELINE ---
 
 def run_bpso_pipeline(df_iterator_factory, target_col='class', candidate_limit=150, 
-                       seed=None, stride=5, population_size=None, knee_S=2.0, **kwargs):
+                       seed=None, stride=5, population_size=None, knee_sensitivity=2.0, 
+                       n_particles=None, max_iter=None):
     
     # --- STEP 1: PROACTIVE DISCOVERY ---
     first_chunk = next(df_iterator_factory())
@@ -161,7 +162,7 @@ def run_bpso_pipeline(df_iterator_factory, target_col='class', candidate_limit=1
     if candidate_limit is None:
         from kneed import KneeLocator
         y_vals = fisher_scores.values
-        kn = KneeLocator(range(len(y_vals)), y_vals, curve='convex', direction='decreasing', S=knee_S)
+        kn = KneeLocator(range(len(y_vals)), y_vals, curve='convex', direction='decreasing', S=knee_sensitivity)
         cutoff_idx = kn.knee if kn.knee is not None else min(150, len(y_vals))
         candidates = fisher_scores.index[:cutoff_idx+1].tolist()
     else:
@@ -181,8 +182,8 @@ def run_bpso_pipeline(df_iterator_factory, target_col='class', candidate_limit=1
     y = narrow_df[target_col].values
 
     # --- STEP 4: OPTIMIZATION ---
-    pop = kwargs.get('n_particles', population_size or int(np.clip(X.shape[1] * 0.3, 20, 60)))
-    iters = kwargs.get('max_iter', int(np.clip(X.shape[1] * 0.4, 15, 40)))
+    pop = n_particles or population_size or int(np.clip(X.shape[1] * 0.3, 20, 60))
+    iters = max_iter or int(np.clip(X.shape[1] * 0.4, 15, 40))
 
     problem = SVMFeatureSelection(X, y, cv=3)
     task = Task(problem, max_iters=iters)
