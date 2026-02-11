@@ -4,7 +4,6 @@ import numpy as np
 import pandas as pd
 import gc
 from kneed import KneeLocator
-from ..feature_scaling.standard import create_standard_scaled_generator
 from .visualization import visualize_amino_diagnostics
 
 # Path handling for amino
@@ -24,7 +23,7 @@ except ImportError as e:
     amino = None
 
 # Import refactored helpers
-from data_access import create_dataframe_factory, get_feature_cols, METADATA_COLS
+from data_access import get_feature_cols, METADATA_COLS
 
 def compute_sequential_fisher(df_iterator_factory, target_col):
     """
@@ -37,20 +36,15 @@ def compute_sequential_fisher(df_iterator_factory, target_col):
     global_sum = {}
     global_sum_sq = {}
     total_count = 0
-    
     feature_cols = None
     
     for chunk in df_iterator_factory():
         if feature_cols is None:
-            # Explicitly exclude all metadata columns and the target column
             feature_cols = [c for c in get_feature_cols(chunk) if c != target_col and c not in METADATA_COLS]
         
         y = chunk[target_col].values
         current_chunk_classes = np.unique(y)
         
-        if total_count == 0:
-            print(f"Found classes: {list(current_chunk_classes)}")
-
         for col in feature_cols:
             if col not in stats:
                 stats[col] = {}
@@ -96,30 +90,27 @@ def compute_sequential_fisher(df_iterator_factory, target_col):
 
 def extract_candidates_only(df_iterator_factory, target_col, candidates):
     """
-    FIXED: Properly yields filtered chunks for concatenation.
+    Properly yields filtered chunks for concatenation.
     """
     print(f"Loading {len(candidates)} candidate features into memory...")
     
-    potential_meta = [c for c in METADATA_COLS if c != target_col]
+    # Peek at metadata once
+    first_chunk = next(df_iterator_factory())
+    existing_meta = [c for c in METADATA_COLS if c in first_chunk.columns and c != target_col]
     
+    cols_to_extract = list(dict.fromkeys(candidates + [target_col] + existing_meta))
+
     def chunk_generator():
         for chunk in df_iterator_factory():
-            # Identify which requested metadata actually exists in this chunk
-            existing_meta = [c for c in potential_meta if c in chunk.columns]
-            # Build final column list for this chunk, removing duplicates
-            cols_to_extract = list(dict.fromkeys(candidates + [target_col] + existing_meta))
-            cols_available = [c for c in cols_to_extract if c in chunk.columns]
-            yield chunk[cols_available]
+            yield chunk[cols_to_extract]
 
     full_df = pd.concat(chunk_generator(), ignore_index=False)
     gc.collect()
     return full_df
 
 def run_fisher_amino_pipeline(df_iterator_factory, target_col='class', max_outputs=5, knee_S=1.0):
-    # Apply standard scaling to the data
-    scaled_df_factory = create_standard_scaled_generator(df_iterator_factory)
-    
-    fisher_s = compute_sequential_fisher(scaled_df_factory, target_col)
+    # Pass 1: Fisher Scores (Using input factory directly)
+    fisher_s = compute_sequential_fisher(df_iterator_factory, target_col)
     
     # Knee Detection
     y_vals = fisher_s.values
@@ -127,22 +118,33 @@ def run_fisher_amino_pipeline(df_iterator_factory, target_col='class', max_outpu
     threshold = kn.knee_y if kn.knee_y else np.percentile(y_vals, 90)
     candidate_features = fisher_s[fisher_s >= threshold].index.tolist()
 
-    # Data Extraction
-    df_amino_input = extract_candidates_only(scaled_df_factory, target_col, candidate_features)
+    # Pass 2: Data Extraction
+    df_amino_input = extract_candidates_only(df_iterator_factory, target_col, candidate_features)
 
     # AMINO Reduction
+    final_names = []
     if amino and len(candidate_features) > 0:
         print(f"Running AMINO on {len(candidate_features)} candidates...")
-        ops = [amino.OrderParameter(name, df_amino_input[name].values) for name in candidate_features]
+        
+        # Internal temporary shift to [0, 1] for AMINO's MI calculations
+        # This does not affect the final returned dataframe values
+        df_shifted = df_amino_input[candidate_features].copy()
+        d_min = df_shifted.min()
+        d_max = df_shifted.max()
+        df_shifted = (df_shifted - d_min) / (d_max - d_min + 1e-12)
+
+        ops = [amino.OrderParameter(name, df_shifted[name].values) for name in candidate_features]
         final_ops = amino.find_ops(ops, max_outputs=max_outputs)
         final_names = [getattr(op, 'name', str(op)) for op in final_ops]
+        del df_shifted
     else:
-        print("AMINO skipped (missing library or candidates). Keeping top candidates.")
+        print("AMINO skipped. Keeping top candidates.")
         limit = max_outputs if max_outputs is not None else 5
         final_names = candidate_features[:limit]
 
     visualize_amino_diagnostics(fisher_s, df_amino_input, final_names, target_col)
 
+    # Prepare final output columns (keeping original standard scaled values)
     meta_present = [c for c in df_amino_input.columns if c in METADATA_COLS]
     final_columns = list(dict.fromkeys(final_names + [target_col] + meta_present))
     

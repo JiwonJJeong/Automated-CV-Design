@@ -75,6 +75,7 @@ from niapy.problems import Problem
 from niapy.task import Task
 from niapy.algorithms.basic import ParticleSwarmOptimization
 from ..feature_scaling.standard import create_standard_scaled_generator
+from .visualization import visualize_bpso_diagnostics
 
 # Standardized helpers
 from data_access import get_feature_cols, METADATA_COLS
@@ -90,6 +91,7 @@ from niapy.problems import Problem
 from niapy.task import Task
 from niapy.algorithms.basic import ParticleSwarmOptimization
 from ..feature_scaling.standard import create_standard_scaled_generator
+from .visualization import visualize_bpso_diagnostics
 
 # Standardized helpers
 from data_access import get_feature_cols, METADATA_COLS
@@ -189,47 +191,8 @@ def run_bpso_pipeline(df_iterator_factory, target_col='class', candidate_limit=1
     best_x, _ = algorithm.run(task)
     final_features = [candidates[i] for i, val in enumerate(best_x) if val > 0.5]
     
-    # --- STEP 5: VISUALIZATION (Optional logic omitted for brevity, same as original) ---
-    # --- STANDARDIZED VISUALIZATION ---
-    try:
-        import matplotlib.pyplot as plt
-        import seaborn as sns
-        
-        fig, axes = plt.subplots(1, 3, figsize=(21, 6))
-        sns.set_theme(style="whitegrid")
-        
-        # 1. Signal Strength (Fisher Scree Plot)
-        y_vals = fisher_scores.values
-        axes[0].plot(range(len(y_vals)), y_vals, color='grey', alpha=0.5)
-        # Highlight selected features on the scree plot
-        selected_indices = [fisher_scores.index.get_loc(f) for f in final_features if f in fisher_scores.index]
-        axes[0].scatter(selected_indices, fisher_scores.iloc[selected_indices], color='red', s=40, label='BPSO Selected', zorder=5)
-        axes[0].set_title("Feature Signal Strength (Fisher)", fontsize=14)
-        axes[0].set_xlabel("Feature Rank")
-        axes[0].set_ylabel("Fisher Score")
-        axes[0].legend()
-        
-        # 2. Redundancy (Correlation Heatmap)
-        if len(final_features) > 1:
-            corr = narrow_df[final_features].corr()
-            sns.heatmap(corr, cmap="coolwarm", center=0, ax=axes[1], annot=False)
-            axes[1].set_title("Feature Redundancy (Correlation)", fontsize=14)
-        else:
-            axes[1].text(0.5, 0.5, "Need 2+ Features\nfor Heatmap", ha='center')
-            
-        # 3. State Space Mapping (2D Scatter)
-        if len(final_features) >= 2:
-            f1, f2 = final_features[0], final_features[1]
-            sample_df = narrow_df.sample(min(2000, len(narrow_df)))
-            sns.scatterplot(data=sample_df, x=f1, y=f2, hue=target_col, palette="deep", s=20, alpha=0.7, ax=axes[2])
-            axes[2].set_title(f"State Space Mapping\n{f1} vs {f2}", fontsize=14)
-        else:
-            axes[2].text(0.5, 0.5, "Need 2+ Features\nfor Scatter Plot", ha='center')
-            
-        plt.tight_layout()
-        plt.show()
-    except Exception as e:
-        print(f"Visualization failed: {e}")
+    # --- STEP 5: VISUALIZATION (Using centralized visualization.py) ---
+    visualize_bpso_diagnostics(narrow_df, fisher_scores, candidates, final_features, target_col)
 
     # --- STEP 6: PASS 3 (RECOVER FULL DATASET) ---
     print(f"Pass 3: Recovering all rows for {len(final_features)} features...")

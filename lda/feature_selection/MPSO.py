@@ -8,7 +8,6 @@ from sklearn.ensemble import BaggingClassifier
 from niapy.problems import Problem
 from niapy.task import Task
 from niapy.algorithms.basic import ParticleSwarmOptimization
-from ..feature_scaling.standard import create_standard_scaled_generator
 from .visualization import visualize_mpso_diagnostics
 
 # Standardized helpers
@@ -17,19 +16,17 @@ from data_access import get_feature_cols, METADATA_COLS
 # --- PASS 1: STREAMING FISHER ---
 
 def compute_fisher_scores(df_iterator, target_col='class', stride=1):
-    """Memory-efficient Fisher scores with stride support."""
+    """Memory-efficient Fisher scores with stride support. Assumes data is scaled."""
     print(f"Pass 1: Computing Fisher scores (stride={stride})...")
     stats = {}
     feature_cols = None
     total_n = 0
 
     for chunk in df_iterator:
-        # APPLY STRIDE TO PASS 1
         if stride > 1:
             chunk = chunk.iloc[::stride]
             
         if feature_cols is None:
-            # Explicitly exclude metadata and target column
             feature_cols = [c for c in get_feature_cols(chunk) 
                            if c != target_col and c not in METADATA_COLS and pd.api.types.is_numeric_dtype(chunk[c])]
         
@@ -75,71 +72,50 @@ class MPSOProjectionProblem(Problem):
         self.cv = cv
         self.redundancy_weight = redundancy_weight
         self.n_feats = X_train.shape[1]
-        self.eval_count = 0  # Track progress
 
     def _evaluate(self, x):
-        self.eval_count += 1
-        
-        # 1. Use Soft Selection (or keep your binary, but scaling is key)
-        # Reshape into (Features, Dims)
         weights = x.reshape((self.n_feats, self.dims))
         sel_matrix = (weights > self.threshold).astype(float)
         
         if np.any(np.sum(sel_matrix, axis=0) == 0):
             return 1.0
 
-        # 2. Projection with Scaling (CRITICAL)
-        # Ensure features are zero-mean/unit-variance so one doesn't dominate
-        # Ideally, X_train should be pre-scaled outside the loop.
+        # Projection: Divide by sum to keep projected values within original feature scale
         projected = np.matmul(self.X_train, sel_matrix) 
-        # Normalize by count to maintain scale
         projected /= (np.sum(sel_matrix, axis=0) + 1e-12)
 
-        # 3. Accuracy Calculation
+        # Accuracy
         clf = OneVsRestClassifier(BaggingClassifier(LinearSVC(dual=False, tol=1e-3), n_estimators=self.n_estimators))
         acc = cross_val_score(clf, projected, self.y_train, cv=self.cv).mean()
 
-        # 4. Enhanced Redundancy (r-squared)
+        # Redundancy
         if self.dims > 1:
-            # Add noise to prevent NaNs in corrcoef
             noise = np.random.normal(0, 1e-10, projected.shape)
             corr_matrix = np.corrcoef(projected + noise, rowvar=False)
-            # Use R-squared to punish high correlations exponentially
             r_sq_matrix = np.square(corr_matrix)
             redundancy = (np.sum(r_sq_matrix) - self.dims) / (self.dims * (self.dims - 1))
             
-            # 5. Feature Overlap Penalty (New)
-            # Penalize if the same feature is used in multiple columns
-            feature_usage = np.sum(sel_matrix, axis=1) # How many dims use feature i
+            # Feature Overlap Penalty
+            feature_usage = np.sum(sel_matrix, axis=1) 
             overlap = np.sum(feature_usage[feature_usage > 1]) / (self.n_feats * self.dims)
         else:
             redundancy = 0
             overlap = 0
             
         sparsity = np.sum(sel_matrix) / (self.n_feats * self.dims)
-
-        # 6. Unified Fitness
-        # Adjust weights: Try increasing redundancy_weight to 0.4 or 0.5
         error_term = self.alpha * (1 - acc) + (1 - self.alpha) * sparsity
-        
-        # Mix in redundancy and overlap
         total_redundancy = (0.7 * redundancy) + (0.3 * overlap)
         
-        fitness = (1.0 - self.redundancy_weight) * error_term + self.redundancy_weight * total_redundancy
-        return fitness
+        return (1.0 - self.redundancy_weight) * error_term + self.redundancy_weight * total_redundancy
 
 # --- MAIN PIPELINE ---
+
 def run_mpso_pipeline(df_iterator_factory, target_col='class', dims=5, candidate_limit=250, max_iter=10, 
-                        alpha=0.9, threshold=0.5, redundancy_weight=0.2, population_size=None, stride=1, knee_S=2.0, **kwargs):
-    """
-    Integrated Pipeline: Optimizes on strided data, returns FULL projected dataset.
-    Advanced parameters (pop_scaling, min_pop, max_pop, n_estimators, cv, seed) 
-    can be passed via kwargs.
-    """
-    # Apply standard scaling to the data
-    scaled_df_factory = create_standard_scaled_generator(df_iterator_factory)
+                        alpha=0.9, threshold=0.5, redundancy_weight=0.2, population_size=None, 
+                        stride=1, knee_S=2.0, pop_scaling=1.0, min_pop=10, max_pop=100, 
+                        n_estimators=5, cv=3, seed=None, **kwargs):
     
-    # 1. Pass 1: Filter (Strided)
+    # 1. Pass 1: Filter (Using raw factory, assuming already scaled)
     fisher_scores = compute_fisher_scores(df_iterator_factory(), target_col, stride=stride)
     if fisher_scores.empty:
         return pd.DataFrame()
@@ -150,15 +126,11 @@ def run_mpso_pipeline(df_iterator_factory, target_col='class', dims=5, candidate
         kn = KneeLocator(range(len(y_vals)), y_vals, curve='convex', direction='decreasing', S=knee_S)
         cutoff_idx = kn.knee if kn.knee is not None else min(250, len(y_vals))
         candidates = fisher_scores.index[:cutoff_idx+1].tolist()
-        print(f"Dynamic candidate selection: Fisher score knee at index {cutoff_idx} ({len(candidates)} features)")
+        print(f"Dynamic candidate selection: {len(candidates)} features selected.")
     else:
         candidates = fisher_scores.index[:candidate_limit].tolist()
 
-    if dims is None:
-        dims = 5
-        print(f"MPSO: Output dimensions set to default (dims={dims})")
-    
-    # 2. Pass 2: Selective RAM Load (Strided for MPSO)
+    # 2. Pass 2: Selective RAM Load
     print(f"Pass 2: Loading search data (stride={stride})...")
     search_data = []
     meta_to_keep = [c for c in METADATA_COLS if c != target_col]
@@ -166,7 +138,6 @@ def run_mpso_pipeline(df_iterator_factory, target_col='class', dims=5, candidate
     for chunk in df_iterator_factory():
         if stride > 1:
             chunk = chunk.iloc[::stride]
-        # Use dict.fromkeys to preserve order while removing duplicates (e.g., if target_col is in candidates or meta)
         cols_to_extract = list(dict.fromkeys(candidates + [target_col] + meta_to_keep))
         available = [c for c in cols_to_extract if c in chunk.columns]
         search_data.append(chunk[available])
@@ -184,26 +155,26 @@ def run_mpso_pipeline(df_iterator_factory, target_col='class', dims=5, candidate
     else:
         dynamic_pop = population_size
         
-    print(f"Beginning Swarm Optimization on {X_search.shape[0]} samples...")
+    print(f"Beginning Swarm Optimization...")
     problem = MPSOProjectionProblem(X_search, y_search, dims=dims, alpha=alpha, threshold=threshold, 
                                      n_estimators=n_estimators, cv=cv, redundancy_weight=redundancy_weight)
     task = Task(problem, max_iters=max_iter)
     algorithm = ParticleSwarmOptimization(population_size=dynamic_pop, seed=seed)
     
     best_x, _ = algorithm.run(task)
-    print(f"\n✅ Optimization complete.")
+    print(f"✅ Optimization complete.")
     
-    # Generate the "Recipe" matrix and Column Names ONCE
+    # Generate Projection Recipe
     best_x_reshaped = best_x.reshape((len(candidates), dims))
     final_sel = (best_x_reshaped > threshold)
     projection_weights = np.sum(final_sel, axis=0) + 1e-12
 
+    # Column Naming Logic
     dim_columns = []
     for dim_idx in range(dims):
         selected_in_dim = np.where(final_sel[:, dim_idx])[0]
         if len(selected_in_dim) > 0:
             dim_scores = best_x_reshaped[selected_in_dim, dim_idx]
-            # Take up to top 2 contributing features for the name
             top_local_idx = np.argsort(dim_scores)[-2:]
             top_features = [candidates[selected_in_dim[i]] for i in top_local_idx]
             dim_name = "_".join(top_features)
@@ -216,22 +187,12 @@ def run_mpso_pipeline(df_iterator_factory, target_col='class', dims=5, candidate
     full_results = []
     
     for chunk in df_iterator_factory():
-        # Ensure only available candidates are used (safeguard)
-        valid_candidates = [c for c in candidates if c in chunk.columns]
-        if len(valid_candidates) != len(candidates):
-             # This should not happen if Pass 1/2 were consistent
-             raise ValueError("Mismatch between candidate features and available columns in FULL pass.")
-             
         X_chunk = chunk[candidates].values
         projected_chunk = np.matmul(X_chunk, final_sel) / projection_weights
         
-        res_chunk = pd.DataFrame(
-            projected_chunk, 
-            columns=dim_columns,
-            index=chunk.index
-        )
-        
+        res_chunk = pd.DataFrame(projected_chunk, columns=dim_columns, index=chunk.index)
         res_chunk[target_col] = chunk[target_col].values
+        
         current_meta = [c for c in meta_to_keep if c in chunk.columns]
         for meta in current_meta:
             res_chunk[meta] = chunk[meta].values
@@ -241,14 +202,10 @@ def run_mpso_pipeline(df_iterator_factory, target_col='class', dims=5, candidate
     final_df = pd.concat(full_results, ignore_index=False)
     gc.collect()
 
-    # --- STANDARDIZED VISUALIZATION ---
+    # Visualization
     visualize_mpso_diagnostics(final_df, fisher_scores, candidates, final_sel, target_col)
 
-    # Identify which original features actually contributed (safeguard)
     contributing_mask = np.any(final_sel, axis=1)
     final_df.attrs['selected_features'] = [candidates[i] for i, m in enumerate(contributing_mask) if m]
 
     return final_df
-
-if __name__ == "__main__":
-    pass
