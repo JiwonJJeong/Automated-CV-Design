@@ -71,10 +71,10 @@ import pandas as pd
 import gc
 from sklearn.model_selection import cross_val_score
 from sklearn.svm import LinearSVC
-from sklearn.preprocessing import StandardScaler
 from niapy.problems import Problem
 from niapy.task import Task
 from niapy.algorithms.basic import ParticleSwarmOptimization
+from ..feature_scaling.standard import create_standard_scaled_generator
 
 # Standardized helpers
 from data_access import get_feature_cols, METADATA_COLS
@@ -86,10 +86,10 @@ import pandas as pd
 import gc
 from sklearn.model_selection import cross_val_score
 from sklearn.svm import LinearSVC
-from sklearn.preprocessing import StandardScaler
 from niapy.problems import Problem
 from niapy.task import Task
 from niapy.algorithms.basic import ParticleSwarmOptimization
+from ..feature_scaling.standard import create_standard_scaled_generator
 
 # Standardized helpers
 from data_access import get_feature_cols, METADATA_COLS
@@ -98,9 +98,10 @@ from data_access import get_feature_cols, METADATA_COLS
 
 class SVMFeatureSelection(Problem):
     def __init__(self, X_train, y_train, alpha=0.95, threshold=0.5, cv=3):
-        # 1. Performance: Scale once so LinearSVC converges instantly
-        self.scaler = StandardScaler()
-        self.X_scaled = self.scaler.fit_transform(X_train)
+        # 1. Performance: Use centralized scaling function
+        self.scaler = create_standard_scaled_generator(lambda: pd.DataFrame(X_train, columns=get_feature_cols(pd.DataFrame(X_train))))
+        scaled_sample = self.scaler()
+        self.X_scaled = scaled_sample.values
         self.y_train = y_train
         
         super().__init__(dimension=X_train.shape[1], lower=0.0, upper=1.0)
@@ -151,7 +152,10 @@ class SVMFeatureSelection(Problem):
 def run_bpso_pipeline(df_iterator_factory, target_col='class', candidate_limit=150, 
                        seed=None, stride=5, population_size=None, knee_S=2.0, **kwargs):
     
-    fisher_scores = compute_streaming_fisher(df_iterator_factory(), target_col, stride=stride)
+    # Apply standard scaling to the data
+    scaled_df_factory = create_standard_scaled_generator(df_iterator_factory)
+    
+    fisher_scores = compute_streaming_fisher(scaled_df_factory, target_col, stride=stride)
     
     if fisher_scores.empty:
         return pd.DataFrame()

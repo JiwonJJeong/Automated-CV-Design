@@ -8,6 +8,7 @@ from sklearn.ensemble import BaggingClassifier
 from niapy.problems import Problem
 from niapy.task import Task
 from niapy.algorithms.basic import ParticleSwarmOptimization
+from ..feature_scaling.standard import create_standard_scaled_generator
 
 # Standardized helpers
 from data_access import get_feature_cols, METADATA_COLS
@@ -76,45 +77,55 @@ class MPSOProjectionProblem(Problem):
         self.eval_count = 0  # Track progress
 
     def _evaluate(self, x):
-        # Selection Matrix (Features x Dims)
         self.eval_count += 1
         
-        # Heartbeat: Visual confirmation that the code is running
-        if self.eval_count % 50 == 0:
-            print(f"  > Evaluations completed: {self.eval_count}...")
-        elif self.eval_count % 5 == 0:
-            print(".", end="", flush=True)
-
-        sel_matrix = (x > self.threshold).reshape((self.n_feats, self.dims))
+        # 1. Use Soft Selection (or keep your binary, but scaling is key)
+        # Reshape into (Features, Dims)
+        weights = x.reshape((self.n_feats, self.dims))
+        sel_matrix = (weights > self.threshold).astype(float)
         
         if np.any(np.sum(sel_matrix, axis=0) == 0):
             return 1.0
 
-        # Matrix Projection
-        projected = np.matmul(self.X_train, sel_matrix) / np.sum(sel_matrix, axis=0)
+        # 2. Projection with Scaling (CRITICAL)
+        # Ensure features are zero-mean/unit-variance so one doesn't dominate
+        # Ideally, X_train should be pre-scaled outside the loop.
+        projected = np.matmul(self.X_train, sel_matrix) 
+        # Normalize by count to maintain scale
+        projected /= (np.sum(sel_matrix, axis=0) + 1e-12)
 
+        # 3. Accuracy Calculation
         clf = OneVsRestClassifier(BaggingClassifier(LinearSVC(dual=False, tol=1e-3), n_estimators=self.n_estimators))
         acc = cross_val_score(clf, projected, self.y_train, cv=self.cv).mean()
 
-        sparsity = np.sum(sel_matrix) / (self.n_feats * self.dims)
-        
-        # --- Redundancy Penalty (Correlation between dimensions) ---
+        # 4. Enhanced Redundancy (r-squared)
         if self.dims > 1:
-            try:
-                # Add tiny noise to avoid constant columns causing NaN correlation
-                noise = np.random.normal(0, 1e-10, projected.shape)
-                corr_matrix = np.abs(np.corrcoef(projected + noise, rowvar=False))
-                # Average of upper triangle (excluding diagonal)
-                redundancy = (np.sum(corr_matrix) - self.dims) / (self.dims * (self.dims - 1))
-            except:
-                redundancy = 1.0 # Max penalty on error
+            # Add noise to prevent NaNs in corrcoef
+            noise = np.random.normal(0, 1e-10, projected.shape)
+            corr_matrix = np.corrcoef(projected + noise, rowvar=False)
+            # Use R-squared to punish high correlations exponentially
+            r_sq_matrix = np.square(corr_matrix)
+            redundancy = (np.sum(r_sq_matrix) - self.dims) / (self.dims * (self.dims - 1))
+            
+            # 5. Feature Overlap Penalty (New)
+            # Penalize if the same feature is used in multiple columns
+            feature_usage = np.sum(sel_matrix, axis=1) # How many dims use feature i
+            overlap = np.sum(feature_usage[feature_usage > 1]) / (self.n_feats * self.dims)
         else:
             redundancy = 0
+            overlap = 0
             
-        # Unified Fitness Score
-        # Trade-off between (Accuracy/Sparsity) and Independence (Redundancy)
-        base_fitness = self.alpha * (1 - acc) + (1 - self.alpha) * sparsity
-        return (1.0 - self.redundancy_weight) * base_fitness + self.redundancy_weight * redundancy
+        sparsity = np.sum(sel_matrix) / (self.n_feats * self.dims)
+
+        # 6. Unified Fitness
+        # Adjust weights: Try increasing redundancy_weight to 0.4 or 0.5
+        error_term = self.alpha * (1 - acc) + (1 - self.alpha) * sparsity
+        
+        # Mix in redundancy and overlap
+        total_redundancy = (0.7 * redundancy) + (0.3 * overlap)
+        
+        fitness = (1.0 - self.redundancy_weight) * error_term + self.redundancy_weight * total_redundancy
+        return fitness
 
 # --- MAIN PIPELINE ---
 def run_mpso_pipeline(df_iterator_factory, target_col='class', dims=5, candidate_limit=250, max_iter=10, 
@@ -124,13 +135,8 @@ def run_mpso_pipeline(df_iterator_factory, target_col='class', dims=5, candidate
     Advanced parameters (pop_scaling, min_pop, max_pop, n_estimators, cv, seed) 
     can be passed via kwargs.
     """
-    # Internal defaults for advanced parameters
-    pop_scaling = kwargs.get('pop_scaling', 0.02)
-    min_pop = kwargs.get('min_pop', 40)
-    max_pop = kwargs.get('max_pop', 100)
-    n_estimators = kwargs.get('n_estimators', 3)
-    cv = kwargs.get('cv', 3)
-    seed = kwargs.get('seed', 42)
+    # Apply standard scaling to the data
+    scaled_df_factory = create_standard_scaled_generator(df_iterator_factory)
     
     # 1. Pass 1: Filter (Strided)
     fisher_scores = compute_fisher_scores(df_iterator_factory(), target_col, stride=stride)

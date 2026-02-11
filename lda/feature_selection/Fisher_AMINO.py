@@ -6,6 +6,7 @@ import gc
 from kneed import KneeLocator
 import matplotlib.pyplot as plt
 import seaborn as sns
+from ..feature_scaling.standard import create_standard_scaled_generator
 
 # Path handling for amino
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -163,7 +164,10 @@ def visualize_amino_diagnostics(fisher_series, candidate_df, final_features, tar
         print(f"Visualization failed: {e}")
 
 def run_fisher_amino_pipeline(df_iterator_factory, target_col='class', max_outputs=5, knee_S=1.0):
-    fisher_s = compute_sequential_fisher(df_iterator_factory, target_col)
+    # Apply standard scaling to the data
+    scaled_df_factory = create_standard_scaled_generator(df_iterator_factory)
+    
+    fisher_s = compute_sequential_fisher(scaled_df_factory, target_col)
     
     # Knee Detection
     y_vals = fisher_s.values
@@ -172,7 +176,7 @@ def run_fisher_amino_pipeline(df_iterator_factory, target_col='class', max_outpu
     candidate_features = fisher_s[fisher_s >= threshold].index.tolist()
 
     # Data Extraction
-    df_amino_input = extract_candidates_only(df_iterator_factory, target_col, candidate_features)
+    df_amino_input = extract_candidates_only(scaled_df_factory, target_col, candidate_features)
 
     # AMINO Reduction
     if amino and len(candidate_features) > 0:

@@ -6,6 +6,7 @@ import sys
 import os
 import matplotlib.pyplot as plt
 import seaborn as sns
+from ..feature_scaling.min_max import create_minmax_scaled_generator
 
 # 1. Path Setup
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -181,10 +182,13 @@ def run_feature_selection_pipeline(df_iterator_factory, target_col='class', stri
                                    q_bins=5, sample_rows=20000, knee_S=5.0, 
                                    bins=None, distortion_filename=None, **kwargs):
     
+    # Apply min-max scaling to the data
+    scaled_df_factory = create_minmax_scaled_generator(df_iterator_factory)
+    
     # 1. Pass 0 & 1: Statistics (Strided for Speed)
-    bin_edges, discovered_classes = estimate_bin_edges_and_classes(df_iterator_factory(), target_col, 
+    bin_edges, discovered_classes = estimate_bin_edges_and_classes(scaled_df_factory(), target_col, 
                                                                   q_bins=q_bins, sample_rows=sample_rows)
-    chi_s = compute_sequential_chi(df_iterator_factory(), target_col, bin_edges, discovered_classes, stride=stride)
+    chi_s = compute_sequential_chi(scaled_df_factory(), target_col, bin_edges, discovered_classes, stride=stride)
     
     # 2. Knee Detection
     y_vals = sorted(chi_s.values, reverse=True)
@@ -194,7 +198,7 @@ def run_feature_selection_pipeline(df_iterator_factory, target_col='class', stri
     print(f"Knee Point: {threshold:.4f} | Candidates: {len(candidate_features)}")
 
     # 3. Pass 2: Load Candidate Data for AMINO (Strided)
-    df_strided = extract_candidates_only(df_iterator_factory(), target_col, candidate_features, stride=stride)
+    df_strided = extract_candidates_only(scaled_df_factory, target_col, candidate_features, stride=stride)
     gc.collect()
 
     # 4. AMINO Redundancy Reduction
