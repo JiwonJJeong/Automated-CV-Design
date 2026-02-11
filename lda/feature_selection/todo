@@ -1,2 +1,7 @@
-Make the None for output dims actually make sense
-(BPSO has no output dim?)
+Error executing MPSO: name 'final_sel' is not defined
+
+Error executing CHI_SQ_AMINO: 'list_iterator' object is not callable
+
+memory issues on evaluation phase
+
+2/11

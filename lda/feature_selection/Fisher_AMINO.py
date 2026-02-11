@@ -89,22 +89,17 @@ def compute_sequential_fisher(df_iterator_factory, target_col):
     return pd.Series(fisher_scores).sort_values(ascending=False)
 
 def extract_candidates_only(df_iterator_factory, target_col, candidates):
-    """
-    Properly yields filtered chunks for concatenation.
-    """
     print(f"Loading {len(candidates)} candidate features into memory...")
     
-    # Peek at metadata once
-    first_chunk = next(df_iterator_factory())
+    # 1. Peek at one chunk to identify metadata columns
+    temp_gen = df_iterator_factory()
+    first_chunk = next(temp_gen)
     existing_meta = [c for c in METADATA_COLS if c in first_chunk.columns and c != target_col]
-    
     cols_to_extract = list(dict.fromkeys(candidates + [target_col] + existing_meta))
-
-    def chunk_generator():
-        for chunk in df_iterator_factory():
-            yield chunk[cols_to_extract]
-
-    full_df = pd.concat(chunk_generator(), ignore_index=False)
+    
+    # 2. Use a FRESH iterator for the actual concatenation to ensure no missing rows
+    full_df = pd.concat([chunk[cols_to_extract] for chunk in df_iterator_factory()], ignore_index=False)
+    
     gc.collect()
     return full_df
 
@@ -118,7 +113,7 @@ def run_fisher_amino_pipeline(df_iterator_factory, target_col='class', n_amino_o
     threshold = kn.knee_y if kn.knee_y else np.percentile(y_vals, 90)
     candidate_features = fisher_s[fisher_s >= threshold].index.tolist()
 
-    # Pass 2: Data Extraction
+    # Pass 2: Data Extraction (create fresh iterator)
     df_amino_input = extract_candidates_only(df_iterator_factory, target_col, candidate_features)
 
     # AMINO Reduction

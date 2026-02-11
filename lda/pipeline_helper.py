@@ -31,15 +31,17 @@ DEFAULT_PARAMETERS = {
             'population_size': {'value': 20, 'help': "Swarm size - more particles = better exploration"},
             'n_particles': {'value': None, 'help': "Override population size for PSO algorithm (None = use population_size)"},
             'max_iter': {'value': 30, 'help': "Max iterations - higher = more optimization"},
+            'mrmr_limit': {'value': 50, 'help': "Number of features to select using mRMR before PSO optimization"},
             'w': {'value': 0.729, 'help': "Inertia weight - controls exploration vs exploitation"},
             'c1': {'value': 1.49445, 'help': "Cognitive parameter - individual learning influence"},
             'c2': {'value': 1.49445, 'help': "Social parameter - swarm influence"},
             'stride': {'value': 10, 'help': "Data sampling stride - higher = less data"}
         },
         'mpso': {
-            'n_dimensions': {'value': None, 'help': "Output dimensions (None = default 5)"},
+            'n_dimensions': {'value': 5, 'help': "Output dimensions"},
             'candidate_limit': {'value': None, 'help': "Max features for optimization (None = Dynamic selection via Fisher Score Knee)"},
             'knee_sensitivity': {'value': 2.0, 'help': "Sensitivity for the candidate filtering knee - higher = more features"},
+            'mrmr_limit': {'value': 60, 'help': "Number of features to select using mRMR before MPSO optimization"},
             'optimization_iterations': {'value': 10, 'help': "PSO iterations - higher = better optimization"},
             'max_candidates': {'value': 40, 'help': "Swarm population size - larger = better search"},
             'accuracy_sparsity_weight': {'value': 0.9, 'help': "Accuracy-sparsity tradeoff - 0.0=accuracy, 1.0=sparsity"},
@@ -288,19 +290,25 @@ def run_interactive_pipeline(data_factory, pipeline_configs, class_assignment_fu
         scaled_df['class'] = scaled_df['construct'] + '_' + scaled_df['subconstruct']
         print(f"Assigned {scaled_df['class'].nunique()} construct-based classes")
 
-    # --- PHASE 2: FEATURE SELECTION (Keep Interactive) ---
+    # --- PHASE 2: FEATURE SELECTION ---
     fs_methods = list(set(c['feature_selection'] for c in pipeline_configs))
     fs_paths = {}
 
     for method in fs_methods:
         path = cache_dir / f"{method}.pkl"
         fs_paths[method] = path
-        def fs_exec(params):
-            return execute_fs_method(method, lambda: [scaled_df], params)
+        
+        # Define the execution function for this specific FS method
+        def fs_exec(params, current_method=method):
+            # This is the "Factory" function that Chi_sq_AMINO/Fisher_AMINO calls
+            def scaled_gen_factory():
+                # Returns a fresh iterator every time it's called
+                return iter([scaled_df]) 
+            
+            # IMPORTANT: Pass the FUNCTION 'scaled_gen_factory', not 'scaled_gen_factory()'
+            return execute_fs_method(current_method, scaled_gen_factory, params)
 
         _ = run_interactive_step_generic(method.upper(), path, 'feature_selection', method, fs_exec)
-        gc.collect()
-
     gc.collect()
 
     # --- PHASE 3: AUTOMATED DIMENSIONALITY REDUCTION ---
@@ -532,18 +540,27 @@ def run_interactive_step_generic(name, cache_path, param_category, param_subcate
 # =============================================================================
 
 def execute_fs_method(method, factory, params):
+    """
+    Dispatches to the correct Feature Selection pipeline.
+    factory: A function that, when called, returns a generator yielding DataFrames.
+    """
     if method == 'bpso':
         from feature_selection.BPSO import run_bpso_pipeline
+        # Pass the factory directly; BPSO will call factory() to get its iterator
         return run_bpso_pipeline(factory, **params)
+        
     elif method == 'mpso':
         from feature_selection.MPSO import run_mpso_pipeline
         return run_mpso_pipeline(factory, **params)
+        
     elif method == 'fisher_amino':
         from feature_selection.Fisher_AMINO import run_fisher_amino_pipeline
         return run_fisher_amino_pipeline(factory, **params)
+        
     elif method == 'chi_sq_amino':
         from feature_selection.Chi_sq_AMINO import run_feature_selection_pipeline
         return run_feature_selection_pipeline(factory, **params)
+        
     raise ValueError(f"Unknown FS: {method}")
 
 def execute_dr_method(method, fs_result, params):

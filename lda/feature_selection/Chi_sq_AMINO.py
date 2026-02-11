@@ -168,13 +168,22 @@ def extract_candidates_only(df_iterator, target_col, candidates, stride=1):
     print(f"Loading {len(candidates)} features (stride={stride})...")
     data_list = []
     
+    # Create iterator once
+    iterator = df_iterator()
+    
     # Proactive discovery of existing metadata
-    first_chunk = next(df_iterator()) # Peek at first chunk to check columns
+    first_chunk = next(iterator) # Peek at first chunk to check columns
     meta_to_keep = [c for c in METADATA_COLS if c in first_chunk.columns and c != target_col]
     
-    # Reset iterator
-    iterator = df_iterator() 
+    # Process the first chunk
+    if stride > 1:
+        first_chunk = first_chunk.iloc[::stride]
+        
+    cols_to_keep = list(dict.fromkeys(candidates + [target_col] + meta_to_keep))
+    available = [c for c in cols_to_keep if c in first_chunk.columns]
+    data_list.append(first_chunk[available])
     
+    # Process remaining chunks
     for chunk in iterator:
         if stride > 1:
             chunk = chunk.iloc[::stride]
@@ -189,7 +198,7 @@ def extract_candidates_only(df_iterator, target_col, candidates, stride=1):
 # MAIN WORKFLOW
 # =============================================================================
 
-def run_feature_selection_pipeline(df_iterator_factory, target_col='class', stride=5, max_amino=10, 
+def run_feature_selection_pipeline(df_iterator_factory, target_col='class', stride=5, max_amino=40, 
                                    q_bins=5, sample_rows=20000, knee_sensitivity=5.0, 
                                    bins=None, distortion_filename=None):
     
@@ -221,7 +230,7 @@ def run_feature_selection_pipeline(df_iterator_factory, target_col='class', stri
 
     # 4. PASS 2: Load Candidate Data for AMINO (Using Min-Max Data)
     # AMINO specifically benefits from 0-1 scaling for its order parameters
-    df_strided = extract_candidates_only(minmax_factory.factory_func, target_col, candidate_features, stride=stride)
+    df_strided = extract_candidates_only(lambda: minmax_factory(), target_col, candidate_features, stride=stride)
     
     # Apply Min-Max manually here just for the memory-resident dataframe used by AMINO
     # (Since extract_candidates_only uses the raw factory to save overhead, we scale the result)

@@ -74,13 +74,16 @@ from sklearn.svm import LinearSVC
 from niapy.problems import Problem
 from niapy.task import Task
 from niapy.algorithms.basic import ParticleSwarmOptimization
-from ..feature_scaling.standard import create_standard_scaled_generator
-from .visualization import visualize_bpso_diagnostics
+
+# Handle both direct execution and module import
+try:
+    from .visualization import visualize_bpso_diagnostics
+except ImportError:
+    # Direct execution - use absolute imports
+    from visualization import visualize_bpso_diagnostics
 
 # Standardized helpers
 from data_access import get_feature_cols, METADATA_COLS
-
-from functools import lru_cache
 
 import numpy as np
 import pandas as pd
@@ -90,8 +93,13 @@ from sklearn.svm import LinearSVC
 from niapy.problems import Problem
 from niapy.task import Task
 from niapy.algorithms.basic import ParticleSwarmOptimization
-from ..feature_scaling.standard import create_standard_scaled_generator
-from .visualization import visualize_bpso_diagnostics
+
+# Handle both direct execution and module import
+try:
+    from .visualization import visualize_bpso_diagnostics
+except ImportError:
+    # Direct execution - use absolute imports
+    from visualization import visualize_bpso_diagnostics
 
 # Standardized helpers
 from data_access import get_feature_cols, METADATA_COLS
@@ -140,11 +148,41 @@ class SVMFeatureSelection(Problem):
         self.cache[feature_key] = score
         return score
 
+def mrmr_ranker(X_df, fisher_series, n_selected):
+    """
+    X_df: DataFrame of candidate features (narrow_df)
+    fisher_series: Series of pre-computed Fisher scores
+    """
+    features = fisher_series.index.tolist()
+    selected = [features[0]]  # Start with the highest Fisher score
+    unselected = features[1:]
+    
+    # Pre-compute correlation matrix for speed
+    corr_matrix = X_df[features].corr().abs().fillna(0)
+
+    while len(selected) < n_selected and unselected:
+        mrmr_scores = []
+        for f in unselected:
+            relevance = fisher_series[f]
+            # Average correlation with already selected features
+            redundancy = corr_matrix.loc[f, selected].mean()
+            
+            # FCQ Formula (avoid division by zero)
+            score = relevance / (redundancy + 1e-5)
+            mrmr_scores.append((score, f))
+        
+        # Pick the feature with the best mRMR score
+        best_feat = max(mrmr_scores, key=lambda x: x[0])[1]
+        selected.append(best_feat)
+        unselected.remove(best_feat)
+        
+    return selected
+
 # --- MAIN PIPELINE ---
 
 def run_bpso_pipeline(df_iterator_factory, target_col='class', candidate_limit=150, 
                        seed=None, stride=5, population_size=None, knee_sensitivity=2.0, 
-                       n_particles=None, max_iter=None):
+                       n_particles=None, max_iter=None, mrmr_limit=50, w=0.729, c1=1.49445, c2=1.49445):
     
     # --- STEP 1: PROACTIVE DISCOVERY ---
     first_chunk = next(df_iterator_factory())
@@ -168,32 +206,43 @@ def run_bpso_pipeline(df_iterator_factory, target_col='class', candidate_limit=1
     else:
         candidates = fisher_scores.index[:candidate_limit].tolist()
     
-    # --- STEP 3: PASS 2 (LOAD SEARCH DATA) ---
-    print(f"Pass 2: Loading {len(candidates)} features (stride={stride})...")
-    # For optimization, we only need candidates + target
-    search_cols = candidates + [target_col]
-    
+    # Step 3: Refine candidates using mRMR
+    print(f"Refining {len(candidates)} candidates using mRMR...")
+
+    # We use the narrow_df (or a sample of it) to calculate redundancy
     search_chunks = []
     for chunk in df_iterator_factory():
-        search_chunks.append(chunk.iloc[::stride][search_cols])
-    
-    narrow_df = pd.concat(search_chunks)
-    X = narrow_df[candidates].values
-    y = narrow_df[target_col].values
+        search_chunks.append(chunk.iloc[::stride][candidates + [target_col]])
+    temp_df = pd.concat(search_chunks)
+
+    # Rank top N features using mRMR
+    mrmr_limit = min(mrmr_limit, len(candidates)) 
+    candidates = mrmr_ranker(temp_df, fisher_scores.loc[candidates], mrmr_limit)
+
+    # --- STEP 3: PASS 2 (LOAD SEARCH DATA FOR BPSO) ---
+    # Now BPSO only works on the mRMR-refined independent features
+    X = temp_df[candidates].values
+    y = temp_df[target_col].values
 
     # --- STEP 4: OPTIMIZATION ---
     pop = n_particles or population_size or int(np.clip(X.shape[1] * 0.3, 20, 60))
     iters = max_iter or int(np.clip(X.shape[1] * 0.4, 15, 40))
 
+    # Set global seed for reproducibility
+    if seed is not None:
+        np.random.seed(seed)
+
     problem = SVMFeatureSelection(X, y, cv=3)
     task = Task(problem, max_iters=iters)
-    algorithm = ParticleSwarmOptimization(population_size=pop, seed=seed)
+    
+    # We remove seed=seed here to avoid potential NiaPy version conflicts
+    algorithm = ParticleSwarmOptimization(population_size=pop, w=w, c1=c1, c2=c2)
     
     best_x, _ = algorithm.run(task)
     final_features = [candidates[i] for i, val in enumerate(best_x) if val > 0.5]
     
     # --- STEP 5: VISUALIZATION (Using centralized visualization.py) ---
-    visualize_bpso_diagnostics(narrow_df, fisher_scores, candidates, final_features, target_col)
+    visualize_bpso_diagnostics(temp_df, fisher_scores, candidates, final_features, target_col)
 
     # --- STEP 6: PASS 3 (RECOVER FULL DATASET) ---
     print(f"Pass 3: Recovering all rows for {len(final_features)} features...")

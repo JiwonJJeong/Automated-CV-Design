@@ -1,4 +1,8 @@
 import numpy as np
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
 import pandas as pd
 import gc
 from sklearn.model_selection import cross_val_score
@@ -8,7 +12,15 @@ from sklearn.ensemble import BaggingClassifier
 from niapy.problems import Problem
 from niapy.task import Task
 from niapy.algorithms.basic import ParticleSwarmOptimization
-from .visualization import visualize_mpso_diagnostics
+
+# Handle both direct execution and module import
+try:
+    from .visualization import visualize_mpso_diagnostics
+    from BPSO import mrmr_ranker
+except ImportError:
+    # Direct execution - use absolute imports
+    from visualization import visualize_mpso_diagnostics
+    from BPSO import mrmr_ranker
 
 # Standardized helpers
 from data_access import get_feature_cols, METADATA_COLS
@@ -113,7 +125,7 @@ class MPSOProjectionProblem(Problem):
 def run_mpso_pipeline(df_iterator_factory, target_col='class', n_dimensions=None, candidate_limit=250, max_iter=10, 
                         accuracy_sparsity_weight=0.9, feature_threshold=0.5, dimension_independence_penalty=0.2, 
                         sampling_stride=1, knee_sensitivity=2.0, pop_scaling=1.0, min_pop=10, max_pop=100, 
-                        max_candidates=None, optimization_iterations=10, random_seed=None):
+                        max_candidates=None, optimization_iterations=10, random_seed=None, mrmr_limit=60):
     
     # 1. Pass 1: Filter (Using raw factory, assuming already scaled)
     fisher_scores = compute_fisher_scores(df_iterator_factory(), target_col, stride=sampling_stride)
@@ -130,8 +142,20 @@ def run_mpso_pipeline(df_iterator_factory, target_col='class', n_dimensions=None
     else:
         candidates = fisher_scores.index[:candidate_limit].tolist()
 
+    # --- NEW: mRMR REFINEMENT ---
+    print(f"Refining {len(candidates)} candidates using mRMR...")
+    
+    # Load a temporary chunk to calculate correlations for mRMR
+    mrmr_sample = next(df_iterator_factory())[candidates]
+    
+    # We want a diverse pool for the MPSO to build dimensions from
+    # Usually 50-80 features is plenty for projection
+    mrmr_limit = min(mrmr_limit, len(candidates)) 
+    candidates = mrmr_ranker(mrmr_sample, fisher_scores.loc[candidates], mrmr_limit)
+    # ----------------------------
+
     # 2. Pass 2: Selective RAM Load
-    print(f"Pass 2: Loading search data (sampling_stride={sampling_stride})...")
+    print(f"Pass 2: Loading search data for {len(candidates)} independent features...")
     search_data = []
     meta_to_keep = [c for c in METADATA_COLS if c != target_col]
     
@@ -153,33 +177,27 @@ def run_mpso_pipeline(df_iterator_factory, target_col='class', n_dimensions=None
     dynamic_pop = max_candidates if max_candidates is not None else 20
         
     print(f"Beginning Swarm Optimization...")
-    problem = MPSOProjectionProblem(X_search, y_search, dims=n_dimensions, alpha=accuracy_sparsity_weight, threshold=feature_threshold, 
-                                     n_estimators=5, cv=3, redundancy_weight=dimension_independence_penalty)
-    task = Task(problem, max_iters=optimization_iterations, seed=random_seed)
-    algorithm = ParticleSwarmOptimization(population_size=dynamic_pop, seed=random_seed)
+    
+    # Set global seed for reproducibility since niapy uses numpy internally
+    if random_seed is not None:
+        np.random.seed(random_seed)
+
+    problem = MPSOProjectionProblem(
+        X_search, y_search, 
+        dims=n_dimensions, 
+        alpha=accuracy_sparsity_weight, 
+        threshold=feature_threshold, 
+        n_estimators=5, 
+        cv=3, 
+        redundancy_weight=dimension_independence_penalty
+    )
+
+    # REMOVE 'seed=' from these two lines:
+    task = Task(problem, max_iters=optimization_iterations)
+    algorithm = ParticleSwarmOptimization(population_size=dynamic_pop)
     
     best_x, _ = algorithm.run(task)
     print(f"✅ Optimization complete.")
-    
-    # Generate Projection Recipe
-    best_x_reshaped = best_x.reshape((len(candidates), n_dimensions))
-    final_sel = (best_x_reshaped > feature_threshold)
-    best_x_reshaped = best_x.reshape((len(candidates), n_dimensions))
-    final_sel = (best_x_reshaped > feature_threshold)
-    projection_weights = np.sum(final_sel, axis=0) + 1e-12
-
-    # Column Naming Logic
-    dim_columns = []
-    for dim_idx in range(n_dimensions):
-        selected_in_dim = np.where(final_sel[:, dim_idx])[0]
-        if len(selected_in_dim) > 0:
-            dim_scores = best_x_reshaped[selected_in_dim, dim_idx]
-            top_local_idx = np.argsort(dim_scores)[-2:]
-            top_features = [candidates[selected_in_dim[i]] for i in top_local_idx]
-            dim_name = "_".join(top_features)
-        else:
-            dim_name = f"dim{dim_idx}"
-        dim_columns.append(f'MPSO_{dim_name}')
 
     # --- PASS 3: Apply to FULL Dataset ---
     print("Pass 3: Recovering all rows and applying projection...")
