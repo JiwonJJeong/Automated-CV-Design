@@ -204,6 +204,15 @@ def run_feature_selection_pipeline(df_iterator_factory, target_col='class', stri
     
     # 1. SETUP: Create the Local Min-Max Wrapper
     # This ensures Chi-Square/AMINO see 0-1 data, but we don't change the original factory
+    
+    # Ensure factory is callable (handle case where list/iterator is passed)
+    if not callable(df_iterator_factory):
+        print("Warning: df_iterator_factory is not callable. Caching data to memory.")
+        cached_data = list(df_iterator_factory)
+        def data_factory():
+            return iter(cached_data)
+        df_iterator_factory = data_factory
+
     minmax_factory = LocalMinMaxWrapper(df_iterator_factory)
     
     # 2. PASS 0 & 1: Statistics (Using Min-Max Data)

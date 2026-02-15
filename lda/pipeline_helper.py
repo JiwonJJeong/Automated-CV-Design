@@ -32,6 +32,7 @@ DEFAULT_PARAMETERS = {
             'n_particles': {'value': None, 'help': "Override population size for PSO algorithm (None = use population_size)"},
             'max_iter': {'value': 30, 'help': "Max iterations - higher = more optimization"},
             'mrmr_limit': {'value': 50, 'help': "Number of features to select using mRMR before PSO optimization"},
+            'accuracy_sparsity_weight': {'value': 0.95, 'help': "Accuracy-sparsity tradeoff (0.0=accuracy, 1.0=sparsity)"},
             'w': {'value': 0.729, 'help': "Inertia weight - controls exploration vs exploitation"},
             'c1': {'value': 1.49445, 'help': "Cognitive parameter - individual learning influence"},
             'c2': {'value': 1.49445, 'help': "Social parameter - swarm influence"},
@@ -287,6 +288,7 @@ def run_interactive_pipeline(data_factory, pipeline_configs, class_assignment_fu
         
     else:
         # Default class assignment
+        scaled_df = scaled_df.copy() # Defragment
         scaled_df['class'] = scaled_df['construct'] + '_' + scaled_df['subconstruct']
         print(f"Assigned {scaled_df['class'].nunique()} construct-based classes")
 
@@ -389,8 +391,40 @@ def run_interactive_pipeline(data_factory, pipeline_configs, class_assignment_fu
     print("\n📊 CALCULATING EVALUATION METRICS...")
     
     # Use existing evaluation system (variance_df unused, pass original_df for feature correlation analysis)
-    # Get original data for correlation analysis
-    original_df = pd.concat(list(data_factory()), ignore_index=False)
+    # Get original data for correlation analysis (Column-filtered to prevent OOM)
+    print("      Filtering evaluation data to keep only selected features + metadata...")
+    
+    # 1. Identify all features used by ANY pipeline
+    all_selected_features = set()
+    for res in final_results.values():
+        if isinstance(res, dict) and 'selected_features' in res:
+            all_selected_features.update(res['selected_features'])
+    
+    # 2. Add metadata columns
+    cols_to_keep = all_selected_features.union(METADATA_COLS)
+    
+    # 3. Load full rows but only necessary columns
+    original_df_chunks = []
+    
+    # Peek at first chunk to handle 'class' or target column if not in metadata
+    first_chunk = next(data_factory())
+    if 'class' in first_chunk.columns: cols_to_keep.add('class')
+    if 'target' in first_chunk.columns: cols_to_keep.add('target')
+    
+    # Reset iterator
+    data_iter = data_factory()
+    
+    for chunk in data_iter:
+        # Intersect with available columns to avoid KeyErrors
+        available = [c for c in cols_to_keep if c in chunk.columns]
+        original_df_chunks.append(chunk[available])
+        
+    original_df = pd.concat(original_df_chunks, ignore_index=False)
+    del original_df_chunks
+    gc.collect()
+    
+    print(f"      Loaded evaluation data: {original_df.shape} (Full rows, filtered columns)")
+    gc.collect()
     summarize_and_evaluate(final_results, variance_df=None, original_df=original_df)
     
     return final_results, scaled_df  # Return scaled_df instead of variance_df
@@ -569,8 +603,11 @@ def execute_dr_method(method, fs_result, params):
     """
     # fs_result is now back to being a DataFrame (MPSO metadata move to .attrs)
     # Ensure it's treated correctly as a DataFrame
-    if isinstance(fs_result, dict) and 'X_selected' in fs_result:
-        fs_result = fs_result['X_selected']
+    if isinstance(fs_result, dict):
+        if 'data' in fs_result:
+             fs_result = fs_result['data']
+        elif 'X_selected' in fs_result:
+             fs_result = fs_result['X_selected']
 
     dr_registry = {
         'flda':   ('dimensionality_reduction.FLDA', 'run_flda'),

@@ -1,9 +1,13 @@
 import plotly.graph_objects as go
+import plotly.express as px
+import matplotlib.pyplot as plt
+import seaborn as sns
 import numpy as np
 import pandas as pd
 from pathlib import Path
 import pickle
 import sys
+import gc
 
 def extract_selected_features(fs_result):
     """Extract selected feature names from different FS method result formats."""
@@ -16,12 +20,23 @@ def extract_selected_features(fs_result):
         exclude_cols = ['class', 'target'] + list(METADATA_COLS)
         return [c for c in fs_result.columns if c not in exclude_cols]
     elif isinstance(fs_result, dict):
+        if 'data' in fs_result:
+            # Recursive check on the wrapped data
+            return extract_selected_features(fs_result['data'])
+            
         # Try to find feature list in common dict keys
-        for key in ['selected_features', 'features', 'feature_names']:
+        for key in ['selected_features', 'features', 'feature_names', 'X_selected']:
             if key in fs_result:
-                return fs_result[key]
-    else:
-        return ["Unknown format"]
+                # If it's a dataframe under one of these keys, get columns
+                val = fs_result[key]
+                if hasattr(val, 'columns'):
+                     from data_access import METADATA_COLS
+                     exclude_cols = ['class', 'target'] + list(METADATA_COLS)
+                     return [c for c in val.columns if c not in exclude_cols]
+                # If it's a list, return it
+                return val
+    
+    return []
 
 def evaluate_separability(df, target_col='class', selected_features=None, return_individual=False):
     """
@@ -106,107 +121,146 @@ def get_feature_importance(original_df, transformed_df, selected_features=None, 
     return loadings
 
 
-def plot_feature_distributions(original_df, transformed_df, pipeline_name, target_col='class', top_n=10):
+def plot_feature_distributions(original_df, transformed_df, pipeline_name, target_col='class', top_n=10, survivors=None):
     """
-    Plot the distribution of top N important original features across different classes.
+    Plot the distribution of top N important original features across different classes using Plotly.
+    Interactive dropdown allows selection of features.
     """
-    import plotly.express as px
     import plotly.graph_objects as go
-    from plotly.subplots import make_subplots
+    import plotly.express as px
     import numpy as np
     
     # Get feature columns (exclude metadata)
-    feature_cols = [c for c in original_df.columns if c not in ['construct', 'subconstruct', 'replica', 'frame_number', 'class', 'time']]
+    from data_access import METADATA_COLS
+    exclude_cols = ['class', 'target'] + list(METADATA_COLS)
+    
+    if survivors:
+        feature_cols = [c for c in survivors if c in original_df.columns]
+    else:
+         # Filter numeric only
+        numeric_cols = original_df.select_dtypes(include=[np.number]).columns
+        feature_cols = [c for c in numeric_cols if c not in exclude_cols]
     
     if not feature_cols:
-        print("      ↳ Warning: No feature columns available for distribution analysis.")
         return
+
+    # 1. Identify Top Features via Variance/Correlation
+    if survivors:
+        top_features = feature_cols[:top_n] # Already sorted by importance if from FS pipeline
+    else:
+        # Simple variance ranking for speed on the subset
+        inter_vars = original_df[feature_cols].var().sort_values(ascending=False)
+        top_features = inter_vars.head(top_n).index.tolist()
     
-    # Calculate feature importance using correlation with classes
-    feature_importance = {}
-    for feat_col in feature_cols:
-        if feat_col in original_df.columns and pd.api.types.is_numeric_dtype(original_df[feat_col]):
-            # Calculate correlation with target classes (one-hot encoded)
-            classes = original_df[target_col].unique()
-            correlations = []
-            
-            for class_label in classes:
-                class_mask = original_df[target_col] == class_label
-                if class_mask.sum() > 1:
-                    feat_vals = original_df.loc[class_mask, feat_col]
-                    # Use variance as a measure of discriminative power
-                    if feat_vals.var() > 0:
-                        correlations.append(feat_vals.var())
-            
-            if correlations:
-                feature_importance[feat_col] = np.mean(correlations)
-    
-    # Get top N most important features
-    sorted_features = sorted(feature_importance.items(), key=lambda x: x[1], reverse=True)[:top_n]
-    
-    if not sorted_features:
-        print("      ↳ Warning: No important features found for distribution analysis.")
+    if not top_features:
         return
+
+    # 2. Setup Plotly Figure
+    fig = go.Figure()
     
-    top_features = [feat for feat, _ in sorted_features]
+    # Use string conversion for robust sorting/grouping
+    classes = sorted(original_df[target_col].astype(str).unique())
+    feature_indices = {} # Map feature -> (start_idx, end_idx)
+    current_idx = 0
     
-    # Create subplots for feature distributions
-    n_features = len(top_features)
-    cols = min(3, n_features)
-    rows = (n_features + cols - 1) // cols
-    
-    fig = make_subplots(
-        rows=rows, 
-        cols=cols,
-        subplot_titles=[f'Distribution of {feat}' for feat in top_features],
-        vertical_spacing=0.15,
-        horizontal_spacing=0.1
-    )
-    
-    colors = px.colors.qualitative.Set1
-    classes = original_df[target_col].unique()
-    
+    # Pre-calculate colors for classes (cycling)
+    colors = px.colors.qualitative.Plotly
+    class_colors = {cls: colors[i % len(colors)] for i, cls in enumerate(classes)}
+
     for i, feat in enumerate(top_features):
-        row = (i // cols) + 1
-        col = (i % cols) + 1
+        start_idx = current_idx
         
-        for j, class_label in enumerate(classes):
-            class_data = original_df[original_df[target_col] == class_label][feat]
+        try:
+            for cls in classes:
+                # Filter by class
+                subset = original_df[original_df[target_col].astype(str) == cls][feat]
+                # Cleanse data
+                subset = subset.replace([np.inf, -np.inf], np.nan).dropna()
+                
+                if subset.empty:
+                    continue
+
+                # Add Histogram Trace
+                fig.add_trace(go.Histogram(
+                    x=subset,
+                    name=cls,
+                    opacity=0.6,
+                    histnorm='probability density',
+                    marker_color=class_colors.get(cls),
+                    legendgroup=cls,
+                    visible=(i==0), # Only first feature active initially
+                    hovertemplate=f"<b>{cls}</b><br>Value: %{{x}}<br>Density: %{{y}}<extra></extra>"
+                ))
+                current_idx += 1
+                
+        except Exception as e:
+            print(f"      ↳ Error plotting feature {feat}: {e}")
+            pass
             
-            if len(class_data) > 0:
-                fig.add_trace(
-                    go.Histogram(
-                        x=class_data,
-                        name=f'{class_label}' if i == 0 else f'{class_label}_{i}',
-                        opacity=0.7,
-                        marker_color=colors[j % len(colors)],
-                        legendgroup=f'class_{class_label}',
-                        showlegend=(i == 0)  # Only show legend for first subplot
-                    ),
-                    row=row, 
-                    col=col
-                )
-        
-        fig.update_xaxes(title_text=feat, row=row, col=col)
-        fig.update_yaxes(title_text="Count", row=row, col=col)
+        feature_indices[feat] = (start_idx, current_idx)
+
+    if current_idx == 0:
+        print("      ↳ Info: No valid data found for distribution plotting.")
+        return
+
+    # 3. Create Dropdown Menu
+    steps = []
+    total_traces = current_idx
     
-    fig.update_layout(
-        title=f"Feature Distributions by Class - Top {top_n} Features - {pipeline_name}",
-        height=300 * rows,
-        template="plotly_white",
-        showlegend=True,
-        legend=dict(
-            orientation="h",
-            yanchor="bottom",
-            y=1.02,
-            xanchor="right",
-            x=1
+    for feat in top_features:
+        if feat not in feature_indices: continue
+        start, end = feature_indices[feat]
+        
+        if start == end: # No traces for this feature
+            continue
+            
+        step = dict(
+            method="update",
+            args=[
+                {"visible": [False] * total_traces},
+                {"title": f"Distribution of {feat} by {target_col}"}
+            ],
+            label=feat
         )
+        # Set visible=True for the slice belonging to this feature
+        for k in range(start, end):
+            step["args"][0]["visible"][k] = True
+            
+        steps.append(step)
+
+    # 4. Layout
+    fig.update_layout(
+        title=f"Distribution of {top_features[0]} by {target_col}" if top_features else f"Feature Distributions by {target_col}",
+        xaxis_title="Feature Value",
+        yaxis_title="Probability Density",
+        barmode='overlay',
+        template="plotly_white",
+        height=500,
+        updatemenus=[dict(
+            active=0,
+            buttons=steps,
+            x=1.1,
+            y=1.1,
+            xanchor='left',
+            yanchor='top',
+            bgcolor='white',
+            bordercolor='lightgrey'
+        )]
     )
     
+    # Add dropdown label annotation
+    fig.add_annotation(
+        text="Select Feature:",
+        x=1.1, y=1.15,
+        xref="paper", yref="paper",
+        showarrow=False,
+        xanchor="left", yanchor="bottom",
+        font=dict(size=12)
+    )
+
     fig.show()
 
-def plot_feature_contributions(original_df, transformed_df, pipeline_name, target_col='class', top_n=10):
+def plot_feature_contributions(original_df, transformed_df, pipeline_name, target_col='class', top_n=10, survivors=None):
     """
     Plot the contribution of each original feature to each latent dimension,
     ranked from highest magnitude to lowest.
@@ -217,7 +271,11 @@ def plot_feature_contributions(original_df, transformed_df, pipeline_name, targe
     import numpy as np
     
     ld_cols = [c for c in transformed_df.columns if c != target_col]
-    feature_cols = [c for c in original_df.columns if c not in ['construct', 'subconstruct', 'replica', 'frame_number', 'class', 'time']]
+    
+    if survivors:
+        feature_cols = [c for c in survivors if c in original_df.columns and c not in ['construct', 'subconstruct', 'replica', 'frame_number', 'class', 'time']]
+    else:
+        feature_cols = [c for c in original_df.columns if c not in ['construct', 'subconstruct', 'replica', 'frame_number', 'class', 'time']]
     
     if not ld_cols or not feature_cols:
         print("      ↳ Warning: Insufficient data for feature contribution analysis.")
@@ -377,8 +435,8 @@ def summarize_and_evaluate(results, variance_df, original_df=None, corr_threshol
         print(f"{rank:<5} | {name:<25} | {total_score:<12.4f} | {len(ld_cols)}")
         print(f"      📉 Selection Stats: {len(used_features)} numeric features available for mapping.")
         
-        # Display hyperparameters if available
-        if isinstance(results[name], dict):
+        # Display hyperparameters if available (Top 3 only)
+        if hasattr(results[name], 'get') and rank <= 3:
             fs_hyperparams = results[name].get('feature_selection_hyperparameters')
             dr_hyperparams = results[name].get('dimensionality_reduction_hyperparameters')
             
@@ -432,174 +490,143 @@ def summarize_and_evaluate(results, variance_df, original_df=None, corr_threshol
                 print(f"      📈 Generating Feature Distributions Analysis...")
                 plot_feature_distributions(original_df, df, name, survivors=used_features)
                 
-                # Third, show the standard visualizations
-                if len(ld_cols) >= 3:
-                    visualize_cluster_biplot_3d(original_df, df, name, survivors=used_features)
-                elif len(ld_cols) == 2:
-                    visualize_cluster_biplot(original_df, df, name, survivors=used_features)
-                elif len(ld_cols) == 1:
-                    visualize_cluster_1d(df, name) # Add this call!
+                # Third, show the standard visualizations using unified projector
+                visualize_projection(original_df, df, name, survivors=used_features)
             except Exception as viz_e:
                 print(f"      ↳ Visualization Error: {viz_e}")
                 sys.stdout.flush()
         print("-" * 100)
         sys.stdout.flush()
+        
+        # Force matplotlib cleanup if used incorrectly elsewhere
+        plt.close('all')
+        gc.collect()
 
-    import gc
     gc.collect()
 
-def visualize_cluster_1d(transformed_df, pipeline_name, target_col='class'):
+def visualize_projection(original_df, transformed_df, pipeline_name, target_col='class', stride=20, survivors=None):
+    """
+    Unified visualization for 1D, 2D, and 3D projections using Plotly.
+    Maintains metadata hovering capability.
+    """
+    import plotly.graph_objects as go
     import plotly.express as px
-    import pandas as pd
-    import numpy as np
+    from data_access import METADATA_COLS
     
     ld_cols = [c for c in transformed_df.columns if c != target_col]
+    n_dims = len(ld_cols)
     
-    # Handle case where we might have 2D data but need 1D visualization
-    if len(ld_cols) == 1:
-        ld_col = ld_cols[0]
-        fig = px.strip(transformed_df, 
-                       x=ld_col, 
-                       y=target_col, 
-                       color=target_col,
-                       title=f"1D Distribution: {pipeline_name}",
-                       labels={ld_col: "Component 1"},
-                       template="plotly_white")
-    elif len(ld_cols) == 2:
-        # If we have 2D data, create a 1D visualization using the first component
-        ld_col = ld_cols[0]
-        fig = px.strip(transformed_df, 
-                       x=ld_col, 
-                       y=target_col, 
-                       color=target_col,
-                       title=f"1D Distribution (Component 1): {pipeline_name}",
-                       labels={ld_col: "Component 1"},
-                       template="plotly_white")
-    else:
-        print(f"Warning: Expected 1D data for 1D visualization, got {len(ld_cols)} dimensions")
+    # Check if we have enough dimensions
+    if n_dims == 0:
         return
-    
-    fig.update_layout(showlegend=False)
-    fig.show()
 
-def visualize_cluster_biplot_3d(original_df, transformed_df, pipeline_name, target_col='class', stride=20, survivors=None):
-    import plotly.graph_objects as go
-    ld_cols = [c for c in transformed_df.columns if c != target_col]
-    centered_df = transformed_df.copy()
-    centered_df[ld_cols] = transformed_df[ld_cols] - transformed_df[ld_cols].mean()
-    df_plot = centered_df.iloc[::stride]
+    # Downsample for plotting performance
+    df_plot = transformed_df.iloc[::stride].copy()
     
+    # Attach Metadata (Strided to match)
+    # Ensure correct index alignment
+    common_idx = df_plot.index.intersection(original_df.index)
+    df_plot = df_plot.loc[common_idx]
+    
+    meta_cols = [c for c in original_df.columns if c in METADATA_COLS]
+    meta_subset = original_df.loc[common_idx, meta_cols]
+    
+    # ----------------
+    # 1D Visualization
+    # ----------------
+    if n_dims == 1:
+        col = ld_cols[0]
+        # Attach metadata to df_plot mainly for hover usage in px
+        for m in meta_cols:
+            df_plot[m] = meta_subset[m]
+            
+        fig = px.strip(df_plot, x=col, y=target_col, color=target_col, 
+                      hover_data=meta_cols,
+                      title=f"1D Projection: {pipeline_name}",
+                      template="plotly_white")
+        fig.show()
+        return
+
+    # ----------------
+    # 2D & 3D Setup
+    # ----------------
     fig = go.Figure()
 
-    # 1. Plot Clusters with Metadata Hover
-    # Identify metadata: only include standardized metadata columns
-    meta_cols = [c for c in original_df.columns if c in METADATA_COLS]
-    
+    # Create Hover Template
+    hover_tmpl = "<b>Class: %{name}</b><br><br>" + \
+                 "<br>".join([f"{c}: %{{customdata[{i}]}}" for i, c in enumerate(meta_cols)]) + \
+                 "<extra></extra>"
+
+    # Plot Points (Clusters)
     for cls in df_plot[target_col].unique():
-        cls_subset = df_plot[df_plot[target_col] == cls]
+        cls_mask = df_plot[target_col] == cls
+        cls_data = df_plot[cls_mask]
+        cls_meta = meta_subset[cls_mask]
         
-        # Pull metadata for this subset
-        common_idx = cls_subset.index.intersection(original_df.index)
-        meta_subset = original_df.loc[common_idx, meta_cols]
-        
-        fig.add_trace(go.Scatter3d(
-            x=cls_subset[ld_cols[0]], y=cls_subset[ld_cols[1]], z=cls_subset[ld_cols[2]],
-            mode='markers', name=str(cls),
-            marker=dict(size=3, opacity=0.8),
-            customdata=meta_subset,
-            hovertemplate="<b>Class: %{name}</b><br>" + 
-                          "<br>".join([f"{c}: %{{customdata[{i}]}}" for i, c in enumerate(meta_cols)]) + 
-                          "<extra></extra>"
-        ))
+        if n_dims == 2:
+            fig.add_trace(go.Scatter(
+                x=cls_data[ld_cols[0]], y=cls_data[ld_cols[1]],
+                mode='markers', name=str(cls),
+                marker=dict(size=6, opacity=0.7),
+                customdata=cls_meta,
+                hovertemplate=hover_tmpl
+            ))
+        else: # 3D or more (take first 3)
+            fig.add_trace(go.Scatter3d(
+                x=cls_data[ld_cols[0]], y=cls_data[ld_cols[1]], z=cls_data[ld_cols[2]],
+                mode='markers', name=str(cls),
+                marker=dict(size=3, opacity=0.8),
+                customdata=cls_meta,
+                hovertemplate=hover_tmpl
+            ))
 
-    # 2. Add Feature Arrows (Loadings) - Numeric Only!
+    # Plot Loadings (Arrows/Lines)
     if survivors:
-        df_sampled = original_df.iloc[::stride]
-        # Strict numeric enforcement
-        original_numeric = df_sampled[survivors].select_dtypes(include=[np.number])
-        common_idx = original_numeric.index.intersection(df_plot.index)
-        
-        if not original_numeric.empty:
-            loadings = original_numeric.loc[common_idx].apply(
-                lambda x: df_plot.loc[common_idx, ld_cols[:3]].corrwith(x)
-            ).T
+        # Calculate loadings using subset for speed
+        available_survivors = [c for c in survivors if c in original_df.columns]
+        if not available_survivors:
+             return
+
+        df_orig_sub = original_df.loc[common_idx, available_survivors].select_dtypes(include=[np.number])
+        if not df_orig_sub.empty:
+            # Correlation with the plotted LDs
+            dims_to_corr = ld_cols[:2] if n_dims == 2 else ld_cols[:3]
+            loadings = df_orig_sub.apply(lambda x: df_plot[dims_to_corr].corrwith(x)).T
             
-            scale = df_plot[ld_cols[:3]].abs().max().max() * 0.9
-            top_features = loadings.abs().sum(axis=1).sort_values(ascending=False).head(10).index
-
-            for feat in top_features:
-                vx, vy, vz = loadings.loc[feat] * scale
-                fig.add_trace(go.Scatter3d(
-                    x=[0, vx], y=[0, vy], z=[0, vz],
-                    mode='lines+text', text=["", feat],
-                    line=dict(color='red', width=4),
-                    legendgroup="arrows", showlegend=False
-                ))
-
-    fig.update_layout(
-        title=f"3D Biplot: {pipeline_name}",
-        scene=dict(xaxis_title=ld_cols[0], yaxis_title=ld_cols[1], zaxis_title=ld_cols[2]),
-        template="plotly_white"
-    )
-    fig.show()
-
-def visualize_cluster_biplot(original_df, transformed_df, pipeline_name, target_col='class', stride=20, survivors=None):
-    import plotly.graph_objects as go
-    ld_cols = [c for c in transformed_df.columns if c != target_col]
-    centered_df = transformed_df.copy()
-    centered_df[ld_cols] = transformed_df[ld_cols] - transformed_df[ld_cols].mean()
-    df_plot = centered_df.iloc[::stride]
-    
-    fig = go.Figure()
-
-    # 1. Plot Clusters with Metadata Hover
-    meta_cols = [c for c in original_df.columns if c in METADATA_COLS]
-    
-    for cls in df_plot[target_col].unique():
-        cls_subset = df_plot[df_plot[target_col] == cls]
-        
-        # Pull metadata for this subset
-        common_idx = cls_subset.index.intersection(original_df.index)
-        meta_subset = original_df.loc[common_idx, meta_cols]
-
-        fig.add_trace(go.Scatter(
-            x=cls_subset[ld_cols[0]], y=cls_subset[ld_cols[1]],
-            mode='markers', name=str(cls),
-            marker=dict(size=8, opacity=0.6),
-            customdata=meta_subset,
-            hovertemplate="<b>Class: %{name}</b><br>" + 
-                          "<br>".join([f"{c}: %{{customdata[{i}]}}" for i, c in enumerate(meta_cols)]) + 
-                          "<extra></extra>"
-        ))
-
-    # 2. Add Feature Arrows (Loadings)
-    if survivors:
-        df_sampled = original_df.iloc[::stride]
-        original_numeric = df_sampled[survivors].select_dtypes(include=[np.number])
-        common_idx = original_numeric.index.intersection(df_plot.index)
-        
-        if not original_numeric.empty:
-            loadings = original_numeric.loc[common_idx].apply(
-                lambda x: df_plot.loc[common_idx, ld_cols[:2]].corrwith(x)
-            ).T
+            # Scale arrows to match plot dimensions
+            plot_max = df_plot[dims_to_corr].abs().max().max()
+            scale = plot_max * 0.9
             
-            scale = df_plot[ld_cols[:2]].abs().max().max() * 0.9
-            top_features = loadings.abs().sum(axis=1).sort_values(ascending=False).head(10).index
-
+            # Take top features
+            top_features = loadings.abs().sum(axis=1).sort_values(ascending=False).head(8).index
+            
             for feat in top_features:
-                vx, vy = loadings.loc[feat] * scale
-                fig.add_trace(go.Scatter(
-                    x=[0, vx], y=[0, vy],
-                    mode='lines+text', text=["", feat],
-                    textposition="top center",
-                    line=dict(color='red', width=2),
-                    legendgroup="arrows", showlegend=False
-                ))
+                vec = loadings.loc[feat] * scale
+                
+                if n_dims == 2:
+                     fig.add_trace(go.Scatter(
+                        x=[0, vec[0]], y=[0, vec[1]],
+                        mode='lines+text', text=["", feat],
+                        line=dict(color='red', width=2),
+                        showlegend=False
+                    ))
+                else: # 3D
+                    fig.add_trace(go.Scatter3d(
+                        x=[0, vec[0]], y=[0, vec[1]], z=[0, vec[2]],
+                        mode='lines+text', text=["", feat],
+                        line=dict(color='red', width=4),
+                        showlegend=False
+                    ))
 
-    fig.update_layout(
-        title=f"2D Biplot: {pipeline_name}",
-        xaxis_title=ld_cols[0], yaxis_title=ld_cols[1],
-        template="plotly_white"
-    )
+    # Layout
+    if n_dims == 2:
+        fig.update_layout(title=f"2D Projection: {pipeline_name}", 
+                         xaxis_title=ld_cols[0], yaxis_title=ld_cols[1],
+                         template="plotly_white")
+    else:
+        fig.update_layout(title=f"3D Projection: {pipeline_name}",
+                         scene=dict(xaxis_title=ld_cols[0], yaxis_title=ld_cols[1], zaxis_title=ld_cols[2]),
+                         template="plotly_white")
+                         
     fig.show()
 

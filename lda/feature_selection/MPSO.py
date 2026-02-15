@@ -127,6 +127,14 @@ def run_mpso_pipeline(df_iterator_factory, target_col='class', n_dimensions=None
                         sampling_stride=1, knee_sensitivity=2.0, pop_scaling=1.0, min_pop=10, max_pop=100, 
                         max_candidates=None, optimization_iterations=10, random_seed=None, mrmr_limit=60):
     
+    # Ensure factory is callable (handle case where list/iterator is passed)
+    if not callable(df_iterator_factory):
+        print("Warning: df_iterator_factory is not callable. Caching data to memory.")
+        cached_data = list(df_iterator_factory)
+        def data_factory():
+            return iter(cached_data)
+        df_iterator_factory = data_factory
+
     # 1. Pass 1: Filter (Using raw factory, assuming already scaled)
     fisher_scores = compute_fisher_scores(df_iterator_factory(), target_col, stride=sampling_stride)
     if fisher_scores.empty:
@@ -198,6 +206,12 @@ def run_mpso_pipeline(df_iterator_factory, target_col='class', n_dimensions=None
     
     best_x, _ = algorithm.run(task)
     print(f"✅ Optimization complete.")
+
+    # Reconstruct transformation from best particle
+    weights = best_x.reshape((len(candidates), n_dimensions))
+    final_sel = (weights > feature_threshold).astype(float)
+    projection_weights = np.sum(final_sel, axis=0) + 1e-12
+    dim_columns = [f'MPSO_Dim{i+1}' for i in range(n_dimensions)]
 
     # --- PASS 3: Apply to FULL Dataset ---
     print("Pass 3: Recovering all rows and applying projection...")

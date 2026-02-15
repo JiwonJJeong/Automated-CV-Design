@@ -1,8 +1,1 @@
-Propagate hyperparameters of saved results to the end of the pipeline
-
-tica/spectral memory optimization
-
-data access-> needs to remove all features where at least one residue is from bp2 as an option (default true)
-
-? fix mpso visualization (Visualization failed: Data must be 1-dimensional, got ndarray of shape (2000, 2) instead)
-but then ends up showing up partially with next visualization plot
+The original_df doesn't have class assingments because it is being taken after variance but before class assignment

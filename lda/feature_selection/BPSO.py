@@ -182,8 +182,17 @@ def mrmr_ranker(X_df, fisher_series, n_selected):
 
 def run_bpso_pipeline(df_iterator_factory, target_col='class', candidate_limit=150, 
                        seed=None, stride=5, population_size=None, knee_sensitivity=2.0, 
-                       n_particles=None, max_iter=None, mrmr_limit=50, w=0.729, c1=1.49445, c2=1.49445):
+                       n_particles=None, max_iter=None, mrmr_limit=50, w=0.729, c1=1.49445, c2=1.49445,
+                       accuracy_sparsity_weight=0.95):
     
+    # Ensure factory is callable (handle case where list/iterator is passed)
+    if not callable(df_iterator_factory):
+        print("Warning: df_iterator_factory is not callable. Caching data to memory.")
+        cached_data = list(df_iterator_factory)
+        def data_factory():
+            return iter(cached_data)
+        df_iterator_factory = data_factory
+
     # --- STEP 1: PROACTIVE DISCOVERY ---
     first_chunk = next(df_iterator_factory())
     all_cols = first_chunk.columns.tolist()
@@ -232,7 +241,7 @@ def run_bpso_pipeline(df_iterator_factory, target_col='class', candidate_limit=1
     if seed is not None:
         np.random.seed(seed)
 
-    problem = SVMFeatureSelection(X, y, cv=3)
+    problem = SVMFeatureSelection(X, y, cv=3, alpha=accuracy_sparsity_weight)
     task = Task(problem, max_iters=iters)
     
     # We remove seed=seed here to avoid potential NiaPy version conflicts

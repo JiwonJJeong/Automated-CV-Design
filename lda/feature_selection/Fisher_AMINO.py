@@ -28,7 +28,7 @@ from data_access import get_feature_cols, METADATA_COLS
 def compute_sequential_fisher(df_iterator_factory, target_col):
     """
     Calculates Fisher scores using a two-pass accumulation method.
-    Fisher score formula: $$F = \frac{\sum n_i (\mu_i - \mu_{total})^2}{\sum n_i \sigma_i^2}$$
+    Fisher score formula: $$F = \\frac{\\sum n_i (\\mu_i - \\mu_{total})^2}{\\sum n_i \\sigma_i^2}$$
     """
     print("Calculating Fisher scores sequentially...")
     
@@ -104,6 +104,14 @@ def extract_candidates_only(df_iterator_factory, target_col, candidates):
     return full_df
 
 def run_fisher_amino_pipeline(df_iterator_factory, target_col='class', n_amino_outputs=None, knee_sensitivity=1.0):
+    # Ensure factory is callable (handle case where list/iterator is passed)
+    if not callable(df_iterator_factory):
+        print("Warning: df_iterator_factory is not callable. Caching data to memory.")
+        cached_data = list(df_iterator_factory)
+        def data_factory():
+            return iter(cached_data)
+        df_iterator_factory = data_factory
+
     # Pass 1: Fisher Scores (Using input factory directly)
     fisher_s = compute_sequential_fisher(df_iterator_factory, target_col)
     
