@@ -298,7 +298,7 @@ def plot_feature_contributions(original_df, transformed_df, pipeline_name, targe
                     # Calculate correlation (contribution strength)
                     corr = np.corrcoef(orig_vals, ld_vals)[0, 1]
                     if not np.isnan(corr):
-                        correlations.append(abs(corr))  # Use absolute value for magnitude
+                        correlations.append(corr)  # Use raw value for magnitude
                         feature_names.append(feat_col)
         
         # Sort by magnitude (descending)

@@ -292,6 +292,9 @@ def run_interactive_pipeline(data_factory, pipeline_configs, class_assignment_fu
         scaled_df['class'] = scaled_df['construct'] + '_' + scaled_df['subconstruct']
         print(f"Assigned {scaled_df['class'].nunique()} construct-based classes")
 
+    print("\n📦 Capturing base data with class assignments for evaluation...")
+    original_df_for_eval = scaled_df.copy()
+
     # --- PHASE 2: FEATURE SELECTION ---
     fs_methods = list(set(c['feature_selection'] for c in pipeline_configs))
     fs_paths = {}
@@ -390,44 +393,25 @@ def run_interactive_pipeline(data_factory, pipeline_configs, class_assignment_fu
     # Calculate evaluation metrics and create leaderboard
     print("\n📊 CALCULATING EVALUATION METRICS...")
     
-    # Use existing evaluation system (variance_df unused, pass original_df for feature correlation analysis)
-    # Get original data for correlation analysis (Column-filtered to prevent OOM)
-    print("      Filtering evaluation data to keep only selected features + metadata...")
-    
-    # 1. Identify all features used by ANY pipeline
+    # Filter it down to only what is needed to save memory
     all_selected_features = set()
     for res in final_results.values():
         if isinstance(res, dict) and 'selected_features' in res:
             all_selected_features.update(res['selected_features'])
     
-    # 2. Add metadata columns
-    cols_to_keep = all_selected_features.union(METADATA_COLS)
+    cols_to_keep = list(all_selected_features.union(METADATA_COLS))
+    if 'class' not in cols_to_keep: cols_to_keep.append('class')
     
-    # 3. Load full rows but only necessary columns
-    original_df_chunks = []
-    
-    # Peek at first chunk to handle 'class' or target column if not in metadata
-    first_chunk = next(data_factory())
-    if 'class' in first_chunk.columns: cols_to_keep.add('class')
-    if 'target' in first_chunk.columns: cols_to_keep.add('target')
-    
-    # Reset iterator
-    data_iter = data_factory()
-    
-    for chunk in data_iter:
-        # Intersect with available columns to avoid KeyErrors
-        available = [c for c in cols_to_keep if c in chunk.columns]
-        original_df_chunks.append(chunk[available])
-        
-    original_df = pd.concat(original_df_chunks, ignore_index=False)
-    del original_df_chunks
-    gc.collect()
-    
-    print(f"      Loaded evaluation data: {original_df.shape} (Full rows, filtered columns)")
-    gc.collect()
+    # Ensure we only keep columns that actually exist
+    cols_to_keep = [c for c in cols_to_keep if c in original_df_for_eval.columns]
+    original_df = original_df_for_eval[cols_to_keep]
+
     summarize_and_evaluate(final_results, variance_df=None, original_df=original_df)
     
-    return final_results, scaled_df  # Return scaled_df instead of variance_df
+    # Optional: Save this labeled base data to disk
+    save_pipeline_results(final_results, original_df, export_dir="results")
+
+    return final_results, scaled_df
 
 
 # =============================================================================
